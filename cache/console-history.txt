@@ -1,0 +1,9 @@
+owner.wallet
+owner.privateKey
+owner
+   console.log("Balance:", ethers.utils.formatEther(balance));
+   const balance = await wbtc.balanceOf(owner.address);
+   await wbtc.mint(owner.address, ethers.utils.parseEther("1"));
+   const [owner] = await ethers.getSigners();
+const wbtc = await WBTC.attach("0x5FbDB2315678afecb367f032d93F642f64180aa3");
+ const WBTC = await ethers.getContractFactory("WBTC");
