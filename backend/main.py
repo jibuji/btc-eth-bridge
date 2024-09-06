@@ -53,7 +53,38 @@ Base.metadata.create_all(bind=engine)
 
 # Web3 and Bitcoin RPC setup
 w3 = Web3(Web3.HTTPProvider(os.getenv('ETH_NODE_URL')))
-btc_rpc = AuthServiceProxy(os.getenv('BTC_NODE_URL'))
+
+btc_rpc = None
+BTC_WALLET_NAME = os.getenv('BTC_WALLET_NAME')  
+
+def load_btc_wallet():
+    global btc_rpc
+    try:
+        base_url = os.getenv('BTC_NODE_URL')
+        btc_rpc = AuthServiceProxy(base_url)
+        
+        wallet_info = btc_rpc.listwalletdir()
+        wallet_exists = any(wallet['name'] == BTC_WALLET_NAME for wallet in wallet_info['wallets'])
+        
+        if not wallet_exists:
+            btc_rpc.createwallet(BTC_WALLET_NAME)
+        else:
+            try:
+                btc_rpc.loadwallet(BTC_WALLET_NAME)
+            except JSONRPCException as e:
+                if "already loaded" not in str(e):
+                    raise
+        
+        wallet_url = f"{base_url}/wallet/{BTC_WALLET_NAME}"
+        btc_rpc = AuthServiceProxy(wallet_url)
+        btc_rpc.getwalletinfo()  # Test the connection
+        
+    except JSONRPCException as e:
+        print(f"Error loading wallet: {str(e)}")
+        raise
+
+# Load the wallet before starting the server
+load_btc_wallet()
 
 # WBTC contract setup
 WBTC_ADDRESS = os.getenv('WBTC_ADDRESS')
@@ -76,7 +107,7 @@ class WrapStatus(BaseModel):
     updated_at: datetime
     eth_tx_hash: Optional[str] = None
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 def create_transaction(db, btc_tx_id, eth_address, amount):
@@ -98,8 +129,12 @@ def update_transaction_status(db, transaction, status):
 async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks):
     db = SessionLocal()
     try:
-        # Broadcast the signed transaction
-        btc_tx_id = btc_rpc.sendrawtransaction(request.signed_btc_tx)
+        # Attempt to broadcast the signed transaction
+        try:
+            btc_tx_id = btc_rpc.sendrawtransaction(request.signed_btc_tx)
+        except JSONRPCException as rpc_error:
+            logger.error(f"Bitcoin RPC error: {str(rpc_error)}")
+            raise HTTPException(status_code=400, detail=f"Failed to broadcast transaction: {str(rpc_error)}")
         
         # Create new transaction record
         transaction = create_transaction(db, btc_tx_id, request.ethereum_address, None)
@@ -109,14 +144,17 @@ async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks)
         background_tasks.add_task(monitor_btc_transaction, transaction.id)
         
         return {"btc_tx_id": btc_tx_id, "message": "Wrap initiated, transaction broadcasted"}
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error in initiate_wrap: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
     finally:
         db.close()
 
-def retry_with_backoff(func, max_retries=3, initial_delay=1, backoff_factor=2):
+def retry_with_backoff(func, max_retries=3, initial_delay=2, backoff_factor=2):
     retries = 0
     while retries < max_retries:
         try:
