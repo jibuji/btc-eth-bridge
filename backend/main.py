@@ -3,21 +3,30 @@ from web3 import Web3
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-from bitcoinrpc.authproxy import AuthServiceProxy
+from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 from decimal import Decimal
 from enum import Enum
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, func
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base
 from datetime import datetime, timedelta
-from web3.exceptions import TimeExhausted
+from web3.exceptions import TimeExhausted, TransactionNotFound
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import atexit
+import time
+from sqlalchemy.exc import IntegrityError
+import traceback
 
 load_dotenv()
 
 app = FastAPI()
+
+# Check for required environment variables
+required_env_vars = ['ETH_NODE_URL', 'BTC_NODE_URL', 'DATABASE_URL', 'OWNER_ADDRESS', 'OWNER_PRIVATE_KEY', 'WBTC_ADDRESS', 'BTC_WALLET_NAME', 'BRIDGE_BTC_ADDRESS']
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
 # Database setup
 engine = create_engine(os.getenv('DATABASE_URL'))
@@ -26,6 +35,8 @@ Base = declarative_base()
 
 class TransactionStatus(Enum):
     PENDING = "pending"
+    MINTING = "minting"
+    MINTING_FAILED = "minting_failed"
     COMPLETED = "completed"
     FAILED = "failed"
     EXPIRED = "expired"
@@ -47,7 +58,49 @@ Base.metadata.create_all(bind=engine)
 
 # Web3 and Bitcoin RPC setup
 w3 = Web3(Web3.HTTPProvider(os.getenv('ETH_NODE_URL')))
-btc_rpc = AuthServiceProxy(os.getenv('BTC_NODE_URL'))
+btc_rpc = None
+BTC_WALLET_NAME = os.getenv('BTC_WALLET_NAME')
+
+def load_btc_wallet():
+    global btc_rpc
+    try:
+        # Initialize the RPC connection
+        base_url = os.getenv('BTC_NODE_URL')
+        btc_rpc = AuthServiceProxy(base_url)
+        
+        # Check if the wallet exists
+        wallet_info = btc_rpc.listwalletdir()
+        wallet_exists = any(wallet['name'] == BTC_WALLET_NAME for wallet in wallet_info['wallets'])
+        
+        if not wallet_exists:
+            # Create the wallet if it doesn't exist
+            btc_rpc.createwallet(BTC_WALLET_NAME)
+            print(f"Created new wallet: {BTC_WALLET_NAME}")
+        else:
+            # Try to load the wallet if it exists
+            try:
+                btc_rpc.loadwallet(BTC_WALLET_NAME)
+                print(f"Loaded existing wallet: {BTC_WALLET_NAME}")
+            except JSONRPCException as e:
+                if "already loaded" in str(e):
+                    print(f"Warning: Wallet '{BTC_WALLET_NAME}' is already loaded. Continuing with the loaded wallet.")
+                else:
+                    raise  # Re-raise the exception if it's not the "already loaded" error
+        
+        # Update the RPC connection to use the specific wallet
+        wallet_url = f"{base_url}/wallet/{BTC_WALLET_NAME}"
+        btc_rpc = AuthServiceProxy(wallet_url)
+        print(f"Wallet URL: {wallet_url}") 
+        # Test the connection
+        _ = btc_rpc.getwalletinfo()
+        print(f"Successfully connected to wallet: {BTC_WALLET_NAME}")
+        
+    except JSONRPCException as e:
+        print(f"Error loading wallet: {str(e)}")
+        raise
+
+# Load the wallet before starting the server
+load_btc_wallet()
 
 # WBTC contract setup
 WBTC_ADDRESS = os.getenv('WBTC_ADDRESS')
@@ -66,19 +119,55 @@ class UnwrapRequest(BaseModel):
     bitcoin_address: str
     amount: float
 
-def verify_btc_transaction(tx_id: str, required_confirmations: int = 6):
-    try:
-        tx = btc_rpc.getrawtransaction(tx_id, True)
-        confirmations = tx.get('confirmations', 0)
-        if confirmations < required_confirmations:
-            raise ValueError(f"Transaction needs {required_confirmations} confirmations, but has only {confirmations}")
-        # Verify the transaction output is to the bridge's BTC address
-        for vout in tx['vout']:
-            if vout['scriptPubKey']['addresses'][0] == os.getenv('BRIDGE_BTC_ADDRESS'):
-                return vout['value']  # Return the amount sent to the bridge
-        raise ValueError("Transaction does not have output to bridge's BTC address")
-    except Exception as e:
-        raise ValueError(f"Failed to verify BTC transaction: {str(e)}")
+def verify_btc_transaction(tx_id: str, required_confirmations: int = 3):
+    max_retries = 3
+    retry_delay = 2  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempting to verify BTC transaction {tx_id} (attempt {attempt + 1})")
+            tx = btc_rpc.gettransaction(tx_id, True)
+            print(f"Transaction details: {tx}")
+            confirmations = tx.get('confirmations', 0)
+            if confirmations < required_confirmations:
+                print(f"Transaction has {confirmations} confirmations, needs {required_confirmations}")
+                raise ValueError(f"Transaction needs {required_confirmations} confirmations, but has only {confirmations}")
+            
+            # Verify the transaction output is to the bridge's BTC address
+            bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
+            print(f"Checking for output to bridge address: {bridge_address}")
+            
+            if 'vout' not in tx:
+                print("Transaction does not contain 'vout' data. Checking 'details' instead.")
+                for detail in tx.get('details', []):
+                    if detail.get('address') == bridge_address and detail.get('category') == 'receive':
+                        print(f"Found matching output in details: {detail}")
+                        return detail['amount']
+            else:
+                for vout in tx['vout']:
+                    if 'scriptPubKey' in vout and 'addresses' in vout['scriptPubKey']:
+                        if bridge_address in vout['scriptPubKey']['addresses']:
+                            print(f"Found matching output: {vout}")
+                            return vout['value']
+            
+            print(f"Full transaction data: {tx}")
+            raise ValueError("Transaction does not have output to bridge's BTC address")
+        except JSONRPCException as e:
+            print(f"RPC error on attempt {attempt + 1}: {str(e)}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                raise ValueError(f"Failed to verify BTC transaction after {max_retries} attempts: {str(e)}")
+        except Exception as e:
+            print(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                raise ValueError(f"Failed to verify BTC transaction: {str(e)}")
+
+    raise ValueError("Failed to verify BTC transaction after all attempts")
 
 def create_transaction(db, btc_tx_id, eth_address, amount):
     transaction = Transaction(
@@ -88,7 +177,6 @@ def create_transaction(db, btc_tx_id, eth_address, amount):
         status=TransactionStatus.PENDING.value
     )
     db.add(transaction)
-    db.commit()
     return transaction
 
 def update_transaction_status(db, transaction, status):
@@ -105,14 +193,31 @@ async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks)
         if existing_transaction:
             if existing_transaction.status == TransactionStatus.COMPLETED.value:
                 raise HTTPException(status_code=400, detail="Transaction already processed")
-            elif existing_transaction.status == TransactionStatus.PENDING.value:
+            elif existing_transaction.status in [TransactionStatus.PENDING.value, TransactionStatus.PENDING_CONFIRMATIONS.value]:
                 return {"message": "Wrap already in progress"}
-        
+            elif existing_transaction.status == TransactionStatus.MINTING_FAILED.value:
+                # We might want to allow retrying failed transactions
+                background_tasks.add_task(mint_wbtc, existing_transaction.id, existing_transaction.eth_address, int(existing_transaction.amount * 10**8))
+                return {"message": "Previous minting failed. Retrying minting process."}
+            elif existing_transaction.status == TransactionStatus.FAILED.value:
+                # This is for other types of failures
+                raise HTTPException(status_code=400, detail="Transaction previously failed. Please contact support.")
+            elif existing_transaction.status == TransactionStatus.EXPIRED.value:
+                raise HTTPException(status_code=400, detail="Transaction expired. Please initiate a new transaction.")
+            else:
+                # This catches any unexpected status values
+                raise HTTPException(status_code=500, detail=f"Transaction in unexpected state: {existing_transaction.status}")
+
         # Verify the Bitcoin transaction
         btc_amount = verify_btc_transaction(request.btc_tx_id)
         
         # Create new transaction record
-        transaction = create_transaction(db, request.btc_tx_id, request.ethereum_address, btc_amount)
+        try:
+            transaction = create_transaction(db, request.btc_tx_id, request.ethereum_address, btc_amount)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return {"message": "Wrap already in progress..."}
         
         # Convert BTC amount to Wei
         amount_wei = int(btc_amount * 10**8)
@@ -121,80 +226,174 @@ async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks)
         background_tasks.add_task(mint_wbtc, transaction.id, request.ethereum_address, amount_wei)
         
         return {"message": "Wrap initiated, WBTC will be minted after confirmation"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
     finally:
         db.close()
 
 def mint_wbtc(transaction_id: int, ethereum_address: str, amount_wei: int):
     db = SessionLocal()
     try:
-        transaction = db.query(Transaction).get(transaction_id)
-        if not transaction or transaction.status != TransactionStatus.PENDING.value:
+        transaction = db.get(Transaction, transaction_id)
+        if not transaction or transaction.status not in [TransactionStatus.PENDING.value, TransactionStatus.MINTING_FAILED.value]:
+            print(f"Transaction {transaction_id} not found or not in PENDING or MINTING_FAILED state")
             return
+        
+        update_transaction_status(db, transaction, TransactionStatus.MINTING.value)
+        
+        owner_address = os.getenv('OWNER_ADDRESS')
+        nonce = w3.eth.get_transaction_count(owner_address)
+        print(f"Current nonce for {owner_address}: {nonce}")
         
         tx = wbtc_contract.functions.mint(
             ethereum_address,
             amount_wei
         ).build_transaction({
-            'from': os.getenv('OWNER_ADDRESS'),
-            'nonce': w3.eth.get_transaction_count(os.getenv('OWNER_ADDRESS')),
+            'from': owner_address,
+            'nonce': nonce,
+            'gas': 2000000,  # Adjust this value as needed
+            'gasPrice': w3.eth.gas_price,
         })
         
-        signed_tx = w3.eth.account.sign_transaction(tx, os.getenv('OWNER_PRIVATE_KEY'))
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        print(f"Transaction built: {tx}")
         
-        # Update transaction with eth_tx_hash
-        transaction.eth_tx_hash = tx_hash.hex()
-        db.commit()
+        signed_tx = w3.eth.account.sign_transaction(tx, os.getenv('OWNER_PRIVATE_KEY'))
+        print("Transaction signed")
         
         try:
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            print(f"Transaction sent. Hash: {tx_hash.hex()}")
+            
+            # Update transaction with eth_tx_hash
+            transaction.eth_tx_hash = tx_hash.hex()
+            db.commit()
+            
             # Wait for transaction receipt with a timeout
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)  # 10 minutes timeout
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)  # Reduced timeout for testing
+            print(f"Transaction mined. Receipt: {receipt}")
             
             # Check for sufficient confirmations
             current_block = w3.eth.block_number
             confirmations = current_block - receipt['blockNumber'] + 1
             
-            if confirmations >= 6:
+            if confirmations >= 1:  # Reduced for testing on local node
                 update_transaction_status(db, transaction, TransactionStatus.COMPLETED.value)
                 print(f"WBTC minted successfully. Transaction hash: {tx_hash.hex()}")
             else:
-                # If not enough confirmations, we'll need to check again later
                 update_transaction_status(db, transaction, TransactionStatus.PENDING_CONFIRMATIONS.value)
-                print(f"WBTC minted, waiting for more confirmations. Current: {confirmations}")
-        except TimeExhausted:
-            update_transaction_status(db, transaction, TransactionStatus.PENDING_CONFIRMATIONS.value)
-            print(f"Transaction sent but not yet mined. Hash: {tx_hash.hex()}")
+                print(f"WBTC minted, waiting for more confirmations. Current: {confirmations}. Transaction: {tx_hash.hex()}")
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            update_transaction_status(db, transaction, TransactionStatus.MINTING_FAILED.value)
+            print(f"Failed to mint WBTC: {str(e)}")
+            print(f"Error trace: {error_trace}")
+            # You might want to send this error to an error tracking service
+            # or log it to a file for further investigation
     except Exception as e:
-        update_transaction_status(db, transaction, TransactionStatus.FAILED.value)
+        error_trace = traceback.format_exc()
+        update_transaction_status(db, transaction, TransactionStatus.MINTING_FAILED.value)
         print(f"Failed to mint WBTC: {str(e)}")
+        print(f"Error trace: {error_trace}")
     finally:
         db.close()
 
-# New function to check pending confirmations
+# Helper function to check transaction status
+def check_transaction_status(tx_hash):
+    try:
+        tx = w3.eth.get_transaction(tx_hash)
+        if tx is None:
+            return "Transaction not found"
+        if tx['blockNumber'] is None:
+            return "Pending"
+        return f"Mined in block {tx['blockNumber']}"
+    except TransactionNotFound:
+        return "Transaction not found"
+
+# You can call this function after minting to check the status
+# print(check_transaction_status(tx_hash.hex()))
+
 def check_pending_confirmations():
     db = SessionLocal()
     try:
         pending_txs = db.query(Transaction).filter_by(status=TransactionStatus.PENDING_CONFIRMATIONS.value).all()
+        # print the details of each pending transaction
+        print("Pending transactions:")
         for tx in pending_txs:
-            receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
-            if receipt:
-                current_block = w3.eth.block_number
-                confirmations = current_block - receipt['blockNumber'] + 1
-                if confirmations >= 6:
-                    update_transaction_status(db, tx, TransactionStatus.COMPLETED.value)
-                    print(f"Transaction {tx.eth_tx_hash} now has {confirmations} confirmations. Marked as completed.")
+            print(f"ID: {tx.id}")
+            print(f"BTC Transaction ID: {tx.btc_tx_id}")
+            print(f"Ethereum Address: {tx.eth_address}")
+            print(f"Amount: {tx.amount}")
+            print(f"Status: {tx.status}")
+            print(f"Created At: {tx.created_at}")
+            print(f"Updated At: {tx.updated_at}")
+            try:
+                receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
+                if receipt:
+                    current_block = w3.eth.block_number
+                    confirmations = current_block - receipt['blockNumber'] + 1
+                    if confirmations >= 6:
+                        update_transaction_status(db, tx, TransactionStatus.COMPLETED.value)
+                        print(f"Transaction {tx.eth_tx_hash} now has {confirmations} confirmations. Marked as completed.")
+                else:
+                    print(f"Transaction {tx.eth_tx_hash} is still pending.")
+            except TransactionNotFound:
+                print(f"Transaction {tx.eth_tx_hash} not found. It may have been dropped or not broadcast.")
+                # You might want to implement some logic here to handle lost transactions
+                # For example, you could mark it as failed after a certain time has passed
+                time_since_creation = datetime.utcnow() - tx.created_at
+                if time_since_creation > timedelta(hours=24):
+                    update_transaction_status(db, tx, TransactionStatus.FAILED.value)
+                    print(f"Transaction {tx.eth_tx_hash} marked as failed due to being unfound for over 24 hours.")
+    except Exception as e:
+        print(f"Error in check_pending_confirmations: {str(e)}")
     finally:
         db.close()
 
 scheduler = BackgroundScheduler()
 
+def retry_failed_mints():
+    db = SessionLocal()
+    try:
+        failed_transactions = db.query(Transaction).filter_by(status=TransactionStatus.MINTING_FAILED.value).all()
+        for tx in failed_transactions:
+            print(f"Retrying failed mint for transaction {tx.id}")
+            mint_wbtc(tx.id, tx.eth_address, int(tx.amount * 10**8))
+    finally:
+        db.close()
 
-#  run with each new Ethereum block:
+scheduler.add_job(
+    func=retry_failed_mints,
+    trigger=IntervalTrigger(minutes=30),
+    id='retry_failed_mints_job',
+    name='Retry failed WBTC mints',
+    replace_existing=True)
+
+def reconcile_balances():
+    db = SessionLocal()
+    try:
+        total_btc_received = db.query(func.sum(Transaction.amount)).filter_by(status=TransactionStatus.COMPLETED.value).scalar() or 0
+        total_wbtc_minted = wbtc_contract.functions.totalSupply().call() / 10**8
+        
+        if abs(total_btc_received - total_wbtc_minted) > 0.00001:  # Allow for small discrepancies due to rounding
+            print(f"Balance mismatch detected: BTC received: {total_btc_received}, WBTC minted: {total_wbtc_minted}")
+            # Send an alert to the system administrators
+    finally:
+        db.close()
+
+scheduler.add_job(
+    func=reconcile_balances,
+    trigger=IntervalTrigger(hours=1),
+    id='reconcile_balances_job',
+    name='Reconcile BTC and WBTC balances',
+    replace_existing=True)
+
+# The check_new_block function will run with each new Ethereum block:
 def check_new_block():
     current_block = w3.eth.block_number
+    print(f"Current block: {current_block}")
     if current_block > check_new_block.last_checked_block:
         check_pending_confirmations()
         check_new_block.last_checked_block = current_block
@@ -293,9 +492,20 @@ def expire_old_transactions():
     finally:
         db.close()
 
-def reconcile_balances():
-    # Implement balance reconciliation logic here
-    pass
+@app.post("/retry-mint/{transaction_id}")
+async def retry_mint(transaction_id: int):
+    db = SessionLocal()
+    try:
+        transaction = db.get(Transaction, transaction_id)
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        if transaction.status != TransactionStatus.MINTING_FAILED.value:
+            raise HTTPException(status_code=400, detail="Transaction is not in a minting failed state")
+        
+        mint_wbtc(transaction.id, transaction.eth_address, int(transaction.amount * 10**8))
+        return {"message": "Mint retry initiated"}
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn

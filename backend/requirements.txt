@@ -1,4 +1,9 @@
-fastapi
-uvicorn
-web3
-pydantic
+   fastapi
+   uvicorn
+   web3
+   python-dotenv
+   sqlalchemy
+   psycopg2-binary  # If you're using PostgreSQL
+   python-bitcoinrpc
+   apscheduler
+   pydantic
