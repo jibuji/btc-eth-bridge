@@ -3,7 +3,7 @@ from web3 import Web3
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
+from bitcoin import rpc
 from decimal import Decimal
 from enum import Enum
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, func, Enum as SQLAlchemyEnum
@@ -19,6 +19,9 @@ from sqlalchemy.exc import IntegrityError
 import traceback
 import logging
 from typing import Optional
+from urllib.parse import urlparse
+import http.client
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -58,33 +61,53 @@ btc_rpc = None
 BTC_WALLET_NAME = os.getenv('BTC_WALLET_NAME')  
 
 def load_btc_wallet():
-    global btc_rpc
+    new_btc_rpc = None
     try:
-        base_url = os.getenv('BTC_NODE_URL')
-        btc_rpc = AuthServiceProxy(base_url)
+        # Parse BTC_NODE_URL
+        btc_node_url = os.getenv('BTC_NODE_URL')
+        if not btc_node_url:
+            raise ValueError("BTC_NODE_URL not set in .env file")
+
+        parsed_url = urlparse(btc_node_url)
         
-        wallet_info = btc_rpc.listwalletdir()
+        # Ensure the URL contains authentication info
+        if not parsed_url.username or not parsed_url.password:
+            raise ValueError("BTC_NODE_URL must include username and password")
+
+        # Create RPC connection
+        new_btc_rpc = rpc.RawProxy(service_url=btc_node_url, timeout=120)
+        
+        wallet_info = new_btc_rpc.listwalletdir()
         wallet_exists = any(wallet['name'] == BTC_WALLET_NAME for wallet in wallet_info['wallets'])
         
         if not wallet_exists:
-            btc_rpc.createwallet(BTC_WALLET_NAME)
+            new_btc_rpc.createwallet(BTC_WALLET_NAME)
         else:
             try:
-                btc_rpc.loadwallet(BTC_WALLET_NAME)
-            except JSONRPCException as e:
+                new_btc_rpc.loadwallet(BTC_WALLET_NAME)
+            except rpc.JSONRPCError as e:
                 if "already loaded" not in str(e):
                     raise
-        
-        wallet_url = f"{base_url}/wallet/{BTC_WALLET_NAME}"
-        btc_rpc = AuthServiceProxy(wallet_url)
-        btc_rpc.getwalletinfo()  # Test the connection
-        
-    except JSONRPCException as e:
+
+        wallet_url = f"{btc_node_url}/wallet/{BTC_WALLET_NAME}"
+        print("wallet_url:", wallet_url)
+        new_btc_rpc = rpc.RawProxy(service_url=wallet_url, timeout=120)
+        walletInfo = new_btc_rpc.getwalletinfo()  # Test the connection
+        print("walletInfo:", walletInfo)
+
+        txInfo = new_btc_rpc.gettransaction("a2410f9bda7a4ebdec2b873c5c9db5f20e4f78f7ed93f12006aa28f449168eaa")
+        print("txInfo:", txInfo)
+        return new_btc_rpc
+
+    except rpc.JSONRPCError as e:
         print(f"Error loading wallet: {str(e)}")
+        raise
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
         raise
 
 # Load the wallet before starting the server
-load_btc_wallet()
+btc_rpc = load_btc_wallet()
 
 # WBTC contract setup
 WBTC_ADDRESS = os.getenv('WBTC_ADDRESS')
@@ -129,12 +152,12 @@ def update_transaction_status(db, transaction, status):
 async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks):
     db = SessionLocal()
     try:
-        # Attempt to broadcast the signed transaction
+        # Attempt to broadcast the signed transaction with retry
         try:
-            btc_tx_id = btc_rpc.sendrawtransaction(request.signed_btc_tx)
-        except JSONRPCException as rpc_error:
-            logger.error(f"Bitcoin RPC error: {str(rpc_error)}")
-            raise HTTPException(status_code=400, detail=f"Failed to broadcast transaction: {str(rpc_error)}")
+            btc_tx_id = send_raw_transaction(request.signed_btc_tx)
+        except Exception as e:
+            logger.error(f"Failed to broadcast transaction after retries: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to broadcast transaction: {str(e)}")
         
         # Create new transaction record
         transaction = create_transaction(db, btc_tx_id, request.ethereum_address, None)
@@ -154,6 +177,14 @@ async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks)
     finally:
         db.close()
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((BrokenPipeError, http.client.RemoteDisconnected))
+)
+def send_raw_transaction(signed_tx):
+    return btc_rpc.sendrawtransaction(signed_tx)
+
 def retry_with_backoff(func, max_retries=3, initial_delay=2, backoff_factor=2):
     retries = 0
     while retries < max_retries:
@@ -165,6 +196,32 @@ def retry_with_backoff(func, max_retries=3, initial_delay=2, backoff_factor=2):
             time.sleep(wait)
             retries += 1
     raise Exception("Max retries reached")
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((BrokenPipeError, http.client.RemoteDisconnected, ConnectionResetError))
+)
+def get_btc_transaction(tx_id: str):
+    global btc_rpc
+    try:
+        return btc_rpc.gettransaction(tx_id)
+    except rpc.JSONRPCError as e:
+        if e.error['code'] == -5:  # Transaction not in mempool
+            logger.warning(f"Transaction {tx_id} not found in mempool: {str(e)}")
+            return None
+        else:
+            logger.error(f"Error fetching transaction {tx_id}: {str(e)}")
+            raise
+    except (BrokenPipeError, http.client.RemoteDisconnected, ConnectionResetError) as e:
+        logger.warning(f"Connection error while fetching transaction {tx_id}: {str(e)}")
+        # Attempt to reconnect
+        btc_rpc = load_btc_wallet()
+        raise  # Raise the exception to trigger a retry
+    except Exception as e:
+        logger.error(f"Unexpected error fetching transaction {tx_id}: {str(e)}")
+        raise
 
 def monitor_btc_transaction(transaction_id: int):
     db = SessionLocal()
@@ -178,41 +235,43 @@ def monitor_btc_transaction(transaction_id: int):
 
         required_confirmations = 3
         while True:
-            try:
-                tx_info = retry_with_backoff(lambda: btc_rpc.gettransaction(transaction.btc_tx_id))
-                confirmations = tx_info.get('confirmations', 0)
-                
-                if confirmations >= required_confirmations:
-                    # Verify the transaction details
-                    amount = verify_btc_transaction(transaction.btc_tx_id)
-                    transaction.amount = amount
-                    db.commit()
-
-                    # Initiate WBTC minting
-                    amount_wei = int(amount * 10**8)
-                    mint_wbtc(transaction.id, transaction.eth_address, amount_wei)
-                    break
-                
-                time.sleep(60)  # Wait for 1 minute before checking again
-            except Exception as e:
-                logger.error(f"Error monitoring transaction {transaction_id}: {str(e)}")
-                time.sleep(300)  # Wait for 5 minutes before retrying on error
+            tx_info = get_btc_transaction(transaction.btc_tx_id)
+            if tx_info is None:
+                # Transaction not found, wait and retry
+                time.sleep(60)
+                continue
+            
+            confirmations = tx_info.get('confirmations', 0)
+            print(f"Confirmations: {confirmations} of tx_id: {transaction.btc_tx_id}")
+            if confirmations >= required_confirmations:
+                # Verify the transaction details
+                amount = verify_btc_transaction(tx_info, transaction.btc_tx_id)
+                transaction.amount = amount
+                db.commit()
+                print(f"Amount: {amount} of tx_id: {transaction.btc_tx_id}")
+                # Initiate WBTC minting
+                amount_wei = int(amount * 10**8)
+                mint_wbtc(transaction.id, transaction.eth_address, amount_wei)
+                break
+            
+            time.sleep(60)  # Wait for 1 minute before checking again
+    except Exception as e:
+        logger.error(f"Error monitoring transaction {transaction_id}: {str(e)}")
     finally:
         db.close()
 
-def verify_btc_transaction(tx_id: str):
-    tx = btc_rpc.gettransaction(tx_id, True)
+def verify_btc_transaction(tx_info: any, tx_id: str):
     bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
-    
-    for vout in tx['vout']:
-        if 'scriptPubKey' in vout and 'addresses' in vout['scriptPubKey']:
-            if bridge_address in vout['scriptPubKey']['addresses']:
-                return vout['value']
+    details = tx_info['details']
+    for detail in details:
+        if detail['category'] == 'receive' and detail['address'] == bridge_address:
+            return detail['amount']
     
     raise ValueError("Transaction does not have output to bridge's BTC address")
 
 def mint_wbtc(transaction_id: int, ethereum_address: str, amount_wei: int):
     db = SessionLocal()
+    print(f"Minting WBTC for transaction {transaction_id} with amount {amount_wei} to {ethereum_address}")
     try:
         transaction = db.get(Transaction, transaction_id)
         if not transaction or transaction.status != TransactionStatus.CONFIRMING:

@@ -110,7 +110,7 @@ if __name__ == "__main__":
     wallet_name = "default"
     recipient_address = os.getenv('BRIDGE_BTC_ADDRESS')
     ethereum_address = os.getenv('WBTC_RECEIVE_ADDRESS')
-    amount_to_send = 0.001  # BTC
+    amount_to_send = 0.61  # BTC
     server_url = "http://localhost:8000/initiate-wrap"
     btc_node_url = os.getenv('BTC_NODE_URL')
     print(f"recipient_address: {recipient_address}")
