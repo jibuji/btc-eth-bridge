@@ -91,12 +91,12 @@ def load_btc_wallet():
 
         wallet_url = f"{btc_node_url}/wallet/{BTC_WALLET_NAME}"
         print("wallet_url:", wallet_url)
-        new_btc_rpc = rpc.RawProxy(service_url=wallet_url, timeout=120)
+        new_btc_rpc = rpc.RawProxy(service_url=wallet_url, timeout=1200)
         walletInfo = new_btc_rpc.getwalletinfo()  # Test the connection
-        print("walletInfo:", walletInfo)
+        # print("walletInfo:", walletInfo)
 
-        txInfo = new_btc_rpc.gettransaction("a2410f9bda7a4ebdec2b873c5c9db5f20e4f78f7ed93f12006aa28f449168eaa")
-        print("txInfo:", txInfo)
+        # txInfo = new_btc_rpc.gettransaction("a2410f9bda7a4ebdec2b873c5c9db5f20e4f78f7ed93f12006aa28f449168eaa")
+        # print("txInfo:", txInfo)
         return new_btc_rpc
 
     except rpc.JSONRPCError as e:
@@ -149,7 +149,7 @@ def update_transaction_status(db, transaction, status):
     db.commit()
 
 @app.post("/initiate-wrap")
-async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks):
+async def initiate_wrap(request: WrapRequest):
     db = SessionLocal()
     try:
         # Attempt to broadcast the signed transaction with retry
@@ -162,9 +162,6 @@ async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks)
         # Create new transaction record
         transaction = create_transaction(db, btc_tx_id, request.ethereum_address, None)
         update_transaction_status(db, transaction, TransactionStatus.BROADCASTED)
-        
-        # Schedule transaction monitoring
-        background_tasks.add_task(monitor_btc_transaction, transaction.id)
         
         return {"btc_tx_id": btc_tx_id, "message": "Wrap initiated, transaction broadcasted"}
     except HTTPException:
@@ -183,6 +180,7 @@ async def initiate_wrap(request: WrapRequest, background_tasks: BackgroundTasks)
     retry=retry_if_exception_type((BrokenPipeError, http.client.RemoteDisconnected))
 )
 def send_raw_transaction(signed_tx):
+    btc_rpc = load_btc_wallet()
     return btc_rpc.sendrawtransaction(signed_tx)
 
 def retry_with_backoff(func, max_retries=3, initial_delay=2, backoff_factor=2):
@@ -204,7 +202,7 @@ def retry_with_backoff(func, max_retries=3, initial_delay=2, backoff_factor=2):
     retry=retry_if_exception_type((BrokenPipeError, http.client.RemoteDisconnected, ConnectionResetError))
 )
 def get_btc_transaction(tx_id: str):
-    global btc_rpc
+    btc_rpc = load_btc_wallet()
     try:
         return btc_rpc.gettransaction(tx_id)
     except rpc.JSONRPCError as e:
@@ -216,12 +214,26 @@ def get_btc_transaction(tx_id: str):
             raise
     except (BrokenPipeError, http.client.RemoteDisconnected, ConnectionResetError) as e:
         logger.warning(f"Connection error while fetching transaction {tx_id}: {str(e)}")
-        # Attempt to reconnect
-        btc_rpc = load_btc_wallet()
         raise  # Raise the exception to trigger a retry
     except Exception as e:
         logger.error(f"Unexpected error fetching transaction {tx_id}: {str(e)}")
         raise
+
+def process_pending_transactions():
+    db = SessionLocal()
+    try:
+        pending_transactions = db.query(Transaction).filter(
+            Transaction.status.in_([TransactionStatus.BROADCASTED, TransactionStatus.CONFIRMING])
+        ).all()
+        
+        for transaction in pending_transactions:
+            # print details of transactions
+            print(f"checking pending Transaction {transaction.id}: {transaction.btc_tx_id}, {transaction.eth_address}, {transaction.status}")
+            monitor_btc_transaction(transaction.id)
+    except Exception as e:
+        logger.error(f"Error processing pending transactions: {str(e)}")
+    finally:
+        db.close()
 
 def monitor_btc_transaction(transaction_id: int):
     db = SessionLocal()
@@ -231,30 +243,29 @@ def monitor_btc_transaction(transaction_id: int):
             logger.error(f"Transaction {transaction_id} not found")
             return
 
-        update_transaction_status(db, transaction, TransactionStatus.CONFIRMING)
+        if transaction.status == TransactionStatus.COMPLETED:
+            logger.info(f"Transaction {transaction_id} already completed")
+            return
+
+        if transaction.status == TransactionStatus.BROADCASTED:
+            update_transaction_status(db, transaction, TransactionStatus.CONFIRMING)
 
         required_confirmations = 3
-        while True:
-            tx_info = get_btc_transaction(transaction.btc_tx_id)
-            if tx_info is None:
-                # Transaction not found, wait and retry
-                time.sleep(60)
-                continue
+        tx_info = get_btc_transaction(transaction.btc_tx_id)
+        if tx_info is None:
+            logger.warning(f"Transaction {transaction_id} not found in mempool")
+            return
+
+        confirmations = tx_info.get('confirmations', 0)
+        if confirmations >= required_confirmations:
+            # Verify the transaction details
+            amount = verify_btc_transaction(tx_info, transaction.btc_tx_id)
+            transaction.amount = amount
+            db.commit()
             
-            confirmations = tx_info.get('confirmations', 0)
-            print(f"Confirmations: {confirmations} of tx_id: {transaction.btc_tx_id}")
-            if confirmations >= required_confirmations:
-                # Verify the transaction details
-                amount = verify_btc_transaction(tx_info, transaction.btc_tx_id)
-                transaction.amount = amount
-                db.commit()
-                print(f"Amount: {amount} of tx_id: {transaction.btc_tx_id}")
-                # Initiate WBTC minting
-                amount_wei = int(amount * 10**8)
-                mint_wbtc(transaction.id, transaction.eth_address, amount_wei)
-                break
-            
-            time.sleep(60)  # Wait for 1 minute before checking again
+            # Initiate WBTC minting
+            amount_wei = int(amount * 10**8)
+            mint_wbtc(transaction.id, transaction.eth_address, amount_wei)
     except Exception as e:
         logger.error(f"Error monitoring transaction {transaction_id}: {str(e)}")
     finally:
@@ -334,9 +345,17 @@ async def wrap_status(btc_tx_id: str):
     finally:
         db.close()
 
-# Scheduler setup
+# Set up the scheduler
 scheduler = BackgroundScheduler()
+scheduler.add_job(
+    process_pending_transactions,
+    IntervalTrigger(minutes=2),
+    id='process_pending_transactions',
+    name='Process pending transactions every 2 minutes',
+    replace_existing=True)
 scheduler.start()
+
+# Shut down the scheduler when exiting the app
 atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == "__main__":
