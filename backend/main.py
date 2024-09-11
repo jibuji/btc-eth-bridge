@@ -22,8 +22,16 @@ from typing import Optional
 from urllib.parse import urlparse
 import http.client
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests
+from web3.exceptions import ContractLogicError
+from bitcoin import SelectParams
+from bitcoin.core import COIN, b2lx, lx, COutPoint, CMutableTxOut, CMutableTxIn, CMutableTransaction
+from bitcoin.wallet import CBitcoinSecret, P2PKHBitcoinAddress
 
 load_dotenv()
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -52,7 +60,46 @@ class Transaction(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     eth_tx_hash = Column(String, nullable=True)
 
-Base.metadata.create_all(bind=engine)
+
+class UnwrapStatus(Enum):
+    RECEIVED = "received"
+    APPROVED = "approved"
+    BURNING = "burning"
+    BURNED = "burned"
+    BTC_TRANSFER_READY = "btc_transfer_ready"
+    BTC_TRANSFER_BROADCASTED = "btc_transfer_broadcasted"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class UnwrapTransaction(Base):
+    __tablename__ = "unwrap_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    eth_address = Column(String)
+    btc_address = Column(String)
+    wbtc_amount = Column(Float)
+    btc_amount = Column(Float)
+    btc_fee = Column(Float)
+    status = Column(SQLAlchemyEnum(UnwrapStatus), default=UnwrapStatus.RECEIVED)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    eth_tx_hash = Column(String, nullable=True)
+    btc_tx_id = Column(String, nullable=True)
+    signed_btc_tx = Column(String, nullable=True)
+
+class UnwrapRequest(BaseModel):
+    eth_address: str
+    btc_address: str
+    wbtc_amount: float
+
+
+
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.debug("All tables created successfully")
+except Exception as e:
+    logger.error(f"Error creating tables: {str(e)}")
 
 # Web3 and Bitcoin RPC setup
 w3 = Web3(Web3.HTTPProvider(os.getenv('ETH_NODE_URL')))
@@ -130,8 +177,7 @@ class WrapStatus(BaseModel):
     updated_at: datetime
     eth_tx_hash: Optional[str] = None
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+
 
 def create_transaction(db, btc_tx_id, eth_address, amount):
     transaction = Transaction(
@@ -345,14 +391,361 @@ async def wrap_status(btc_tx_id: str):
     finally:
         db.close()
 
+
+@app.post("/initiate-unwrap")
+async def initiate_unwrap(request: UnwrapRequest):
+    db = SessionLocal()
+    try:
+        logger.info(f"Initiating unwrap: {request}")
+        # Calculate total BTC fee (including converted ETH fee)
+        btc_fee = calculate_btc_fee(request.wbtc_amount)
+        btc_amount = request.wbtc_amount - btc_fee
+
+        unwrap_tx = UnwrapTransaction(
+            eth_address=request.eth_address,
+            btc_address=request.btc_address,
+            wbtc_amount=request.wbtc_amount,
+            btc_amount=btc_amount,
+            btc_fee=btc_fee,
+            status=UnwrapStatus.RECEIVED
+        )
+        db.add(unwrap_tx)
+        db.commit()
+        logger.info(f"Unwrap transaction created: {unwrap_tx.id}")
+
+        return {
+            "unwrap_id": unwrap_tx.id,
+            "btc_fee": btc_fee,
+            "message": "Unwrap initiated, waiting for approval"
+        }
+    except Exception as e:
+        logger.error(f"Error in initiate_unwrap: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+    finally:
+        db.close()
+
+@app.post("/approve-unwrap/{unwrap_id}")
+async def approve_unwrap(unwrap_id: int):
+    db = SessionLocal()
+    try:
+        logger.info(f"Approving unwrap: {unwrap_id}")
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_id).first()
+        if not unwrap_tx or unwrap_tx.status != UnwrapStatus.RECEIVED:
+            logger.warning(f"Invalid unwrap transaction: {unwrap_id}")
+            raise HTTPException(status_code=400, detail="Invalid unwrap transaction")
+        
+        unwrap_tx.status = UnwrapStatus.APPROVED
+        db.commit()
+        logger.info(f"Unwrap transaction approved: {unwrap_id}")
+
+        return {"message": "Unwrap approved, processing will begin shortly"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in approve_unwrap: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+    finally:
+        db.close()
+
+
+def process_unwrap_transactions():
+    logger.info("Starting to process unwrap transactions")
+    db = SessionLocal()
+    try:
+        pending_transactions = db.query(UnwrapTransaction).filter(
+            UnwrapTransaction.status.in_([
+                UnwrapStatus.APPROVED,
+                UnwrapStatus.BURNING,
+                UnwrapStatus.BURNED,
+                UnwrapStatus.BTC_TRANSFER_READY,
+                UnwrapStatus.BTC_TRANSFER_BROADCASTED
+            ])
+        ).all()
+
+        logger.info(f"Found {len(pending_transactions)} pending unwrap transactions")
+        for transaction in pending_transactions:
+            process_unwrap_transaction(transaction.id)
+    except Exception as e:
+        logger.error(f"Error processing unwrap transactions: {str(e)}")
+    finally:
+        db.close()
+
+def process_unwrap_transaction(unwrap_id: int):
+    logger.info(f"Processing unwrap transaction: {unwrap_id}")
+    db = SessionLocal()
+    try:
+        unwrap_tx = db.get(UnwrapTransaction, unwrap_id)
+        if not unwrap_tx:
+            logger.error(f"Unwrap transaction {unwrap_id} not found")
+            return
+
+        if unwrap_tx.status == UnwrapStatus.APPROVED:
+            burn_wbtc(unwrap_tx)
+        elif unwrap_tx.status == UnwrapStatus.BURNING:
+            check_burn_transaction(unwrap_tx)
+        elif unwrap_tx.status == UnwrapStatus.BURNED:
+            create_btc_transaction(unwrap_tx)
+        elif unwrap_tx.status == UnwrapStatus.BTC_TRANSFER_READY:
+            broadcast_btc_transaction(unwrap_tx)
+        elif unwrap_tx.status == UnwrapStatus.BTC_TRANSFER_BROADCASTED:
+            check_btc_transaction(unwrap_tx)
+
+    except Exception as e:
+        logger.error(f"Error processing unwrap transaction {unwrap_id}: {str(e)}")
+        # if the tx is created more than 48 hours ago, set the status to failed
+        if unwrap_tx.created_at < datetime.utcnow() - timedelta(days=2):
+            unwrap_tx.status = UnwrapStatus.FAILED
+            db.commit()
+    finally:
+        db.close()
+
+def burn_wbtc(unwrap_tx: UnwrapTransaction):
+    logger.info(f"Burning WBTC for unwrap transaction: {unwrap_tx.id}")
+    db = SessionLocal()
+    try:
+        # Fetch the latest transaction data
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx.id).with_for_update().first()
+        if not unwrap_tx or unwrap_tx.status != UnwrapStatus.APPROVED:
+            logger.warning(f"Invalid unwrap transaction state for burning: {unwrap_tx.id}")
+            return
+
+        # Prepare the burn transaction
+        amount_wei = int(unwrap_tx.wbtc_amount * 10**8)  # Convert WBTC amount to wei
+        nonce = w3.eth.get_transaction_count(os.getenv('OWNER_ADDRESS'))
+        
+        burn_tx = wbtc_contract.functions.burn(
+            unwrap_tx.eth_address,
+            amount_wei
+        ).build_transaction({
+            'from': os.getenv('OWNER_ADDRESS'),
+            'nonce': nonce,
+            'gas': 200000,  # Adjust gas limit as needed
+            'gasPrice': w3.eth.gas_price,
+        })
+        
+        # Sign and send the transaction
+        signed_tx = w3.eth.account.sign_transaction(burn_tx, os.getenv('OWNER_PRIVATE_KEY'))
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        
+        # Update the transaction status and eth_tx_hash
+        unwrap_tx.status = UnwrapStatus.BURNING
+        unwrap_tx.eth_tx_hash = tx_hash.hex()
+        db.commit()
+        
+        logger.info(f"WBTC burn transaction sent for unwrap {unwrap_tx.id}. TX hash: {unwrap_tx.eth_tx_hash}")
+    except ContractLogicError as e:
+        logger.error(f"Contract error while burning WBTC for unwrap {unwrap_tx.id}: {str(e)}")
+        unwrap_tx.status = UnwrapStatus.FAILED
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Error burning WBTC for unwrap {unwrap_tx.id}: {str(e)}")
+        raise
+    finally:
+        db.close()
+
+def check_burn_transaction(unwrap_tx: UnwrapTransaction):
+    logger.info(f"Checking burn transaction for unwrap: {unwrap_tx.id}")
+    db = SessionLocal()
+    try:
+        # Fetch the latest transaction data
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx.id).with_for_update().first()
+        if not unwrap_tx or unwrap_tx.status != UnwrapStatus.BURNING:
+            logger.warning(f"Invalid unwrap transaction state for checking burn: {unwrap_tx.id}")
+            return
+
+        # Check if the burn transaction is confirmed
+        try:
+            receipt = w3.eth.get_transaction_receipt(unwrap_tx.eth_tx_hash)
+            if receipt is None:
+                logger.info(f"Burn transaction for unwrap {unwrap_tx.id} not yet mined")
+                return
+
+            confirmations = w3.eth.block_number - receipt['blockNumber']
+            required_confirmations = 6  # You can adjust this number based on your security requirements
+
+            if confirmations >= required_confirmations:
+                if receipt['status'] == 1:
+                    logger.info(f"Burn transaction for unwrap {unwrap_tx.id} confirmed successfully")
+                    unwrap_tx.status = UnwrapStatus.BURNED
+                    db.commit()
+                else:
+                    logger.error(f"Burn transaction for unwrap {unwrap_tx.id} failed")
+                    unwrap_tx.status = UnwrapStatus.FAILED
+                    db.commit()
+            else:
+                logger.info(f"Burn transaction for unwrap {unwrap_tx.id} has {confirmations} confirmations, waiting for {required_confirmations}")
+
+        except Exception as e:
+            logger.error(f"Error checking burn transaction for unwrap {unwrap_tx.id}: {str(e)}")
+            # Don't update the status here, we'll retry on the next check
+
+    except Exception as e:
+        logger.error(f"Database error in check_burn_transaction for unwrap {unwrap_tx.id}: {str(e)}")
+    finally:
+        db.close()
+
+def create_btc_transaction(unwrap_tx_id: int):
+    logger.info(f"Creating BTC transaction for unwrap: {unwrap_tx_id}")
+    db = SessionLocal()
+    try:
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx_id).with_for_update().first()
+        if not unwrap_tx or unwrap_tx.status != UnwrapStatus.BURNED:
+            logger.warning(f"Invalid unwrap transaction state for creating BTC tx: {unwrap_tx_id}")
+            return
+
+        # Load the Bitcoin wallet
+        btc_rpc = load_btc_wallet()
+
+        # Get the bridge's Bitcoin address
+        bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
+
+        # Calculate the amount to send
+        amount_to_send = Decimal(str(unwrap_tx.btc_amount))
+        fee = Decimal(str(unwrap_tx.btc_fee))
+
+        # Create a raw transaction
+        inputs = btc_rpc.listunspent(0, 9999999, [bridge_address])
+        if not inputs:
+            logger.error("No unspent transactions found")
+            raise Exception("No unspent transactions found")
+
+        # Calculate total available amount
+        total_amount = sum(Decimal(str(input['amount'])) for input in inputs)
+
+        if total_amount < amount_to_send + fee:
+            logger.error("Not enough funds to create the transaction")
+            raise Exception("Not enough funds to create the transaction")
+
+        # Prepare inputs and outputs
+        tx_inputs = [{"txid": input['txid'], "vout": input['vout']} for input in inputs]
+        tx_outputs = {
+            unwrap_tx.btc_address: float(amount_to_send),
+            bridge_address: float(total_amount - amount_to_send - fee)  # Change
+        }
+
+        # Create raw transaction
+        raw_tx = btc_rpc.createrawtransaction(tx_inputs, tx_outputs)
+
+        # Sign the transaction
+        signed_tx = btc_rpc.signrawtransactionwithwallet(raw_tx)
+
+        if not signed_tx['complete']:
+            logger.error("Failed to sign the transaction")
+            raise Exception("Failed to sign the transaction")
+
+        # Store the signed transaction hex
+        unwrap_tx.signed_btc_tx = signed_tx['hex']
+        unwrap_tx.status = UnwrapStatus.BTC_TRANSFER_READY
+        db.commit()
+
+        logger.info(f"BTC transaction created for unwrap {unwrap_tx_id}: {signed_tx['hex']}")
+
+    except Exception as e:
+        logger.error(f"Error creating BTC transaction for unwrap {unwrap_tx_id}: {str(e)}")
+        db.rollback()
+    finally:
+        db.close()
+
+def broadcast_btc_transaction(unwrap_tx_id: int):
+    logger.info(f"Broadcasting BTC transaction for unwrap: {unwrap_tx_id}")
+    db = SessionLocal()
+    try:
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx_id).with_for_update().first()
+        if not unwrap_tx or unwrap_tx.status != UnwrapStatus.BTC_TRANSFER_READY:
+            logger.warning(f"Invalid unwrap transaction state for broadcasting BTC tx: {unwrap_tx_id}")
+            return
+
+        # Load the Bitcoin wallet
+        btc_rpc = load_btc_wallet()
+
+        # Broadcast the signed transaction
+        btc_tx_id = btc_rpc.sendrawtransaction(unwrap_tx.signed_btc_tx)
+        
+        # Update the transaction status and btc_tx_id
+        unwrap_tx.status = UnwrapStatus.BTC_TRANSFER_BROADCASTED
+        unwrap_tx.btc_tx_id = btc_tx_id
+        db.commit()
+        
+        logger.info(f"BTC transaction broadcasted for unwrap {unwrap_tx_id}. TX ID: {btc_tx_id}")
+
+    except rpc.JSONRPCError as e:
+        logger.error(f"Error broadcasting BTC transaction for unwrap {unwrap_tx_id}: {str(e)}")
+        unwrap_tx.status = UnwrapStatus.FAILED
+        db.commit()
+
+    except Exception as e:
+        logger.warning(f"Error in broadcast_btc_transaction for unwrap {unwrap_tx_id}: {str(e)}")
+        raise
+
+    finally:
+        db.close()
+
+def check_btc_transaction(unwrap_tx_id: int):
+    logger.info(f"Checking BTC transaction for unwrap: {unwrap_tx_id}")
+    db = SessionLocal()
+    try:
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx_id).with_for_update().first()
+        if not unwrap_tx or unwrap_tx.status != UnwrapStatus.BTC_TRANSFER_BROADCASTED:
+            logger.warning(f"Invalid unwrap transaction state for checking BTC tx: {unwrap_tx_id}")
+            return
+
+        # Load the Bitcoin wallet
+        btc_rpc = load_btc_wallet()
+
+        try:
+            # Get the transaction details
+            tx_info = btc_rpc.gettransaction(unwrap_tx.btc_tx_id)
+            
+            # Check the number of confirmations
+            confirmations = tx_info.get('confirmations', 0)
+            required_confirmations = 3  # You can adjust this number based on your security requirements
+
+            if confirmations >= required_confirmations:
+                logger.info(f"BTC transaction for unwrap {unwrap_tx_id} confirmed with {confirmations} confirmations")
+                unwrap_tx.status = UnwrapStatus.COMPLETED
+                db.commit()
+                logger.info(f"Unwrap {unwrap_tx_id} completed successfully")
+            else:
+                logger.info(f"BTC transaction for unwrap {unwrap_tx_id} has {confirmations} confirmations, waiting for {required_confirmations}")
+
+        except rpc.JSONRPCError as e:
+            if e.error['code'] == -5:  # Transaction not in wallet
+                logger.warning(f"BTC transaction {unwrap_tx.btc_tx_id} not found in wallet: {str(e)}")
+            else:
+                logger.error(f"Error checking BTC transaction for unwrap {unwrap_tx_id}: {str(e)}")
+                # Don't update the status here, we'll retry on the next check
+        except Exception as e:
+            logger.error(f"Unexpected error checking BTC transaction for unwrap {unwrap_tx_id}: {str(e)}")
+            # Don't update the status here, we'll retry on the next check
+
+    except Exception as e:
+        logger.error(f"Database error in check_btc_transaction for unwrap {unwrap_tx_id}: {str(e)}")
+    finally:
+        db.close()
+
+
+def calculate_btc_fee(amount: float):
+    return 0.00011  # Default to 0.0001 BTC if calculation fails
+
+
 # Set up the scheduler
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     process_pending_transactions,
-    IntervalTrigger(minutes=2),
+    IntervalTrigger(minutes=10),
     id='process_pending_transactions',
     name='Process pending transactions every 2 minutes',
     replace_existing=True)
+
+scheduler.add_job(
+    process_unwrap_transactions,
+    IntervalTrigger(minutes=1),
+    id='process_unwrap_transactions',
+    name='Process pending unwrap transactions every 2 minutes',
+    replace_existing=True)
+
 scheduler.start()
 
 # Shut down the scheduler when exiting the app

@@ -1,3 +1,4 @@
+import argparse
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 import requests
 from dotenv import load_dotenv
@@ -105,19 +106,49 @@ def create_and_send_btc_transaction(recipient_address, amount_btc, server_url, e
         print(f"An error occurred while sending the request to the server: {e}")
         return None
 
-# Example usage
+def initiate_unwrap(eth_address, btc_address, wbtc_amount, server_url):
+    try:
+        payload = {
+            'eth_address': eth_address,
+            'btc_address': btc_address,
+            'wbtc_amount': wbtc_amount
+        }
+        response = requests.post(f"{server_url}/initiate-unwrap", json=payload)
+        
+        if response.status_code == 200:
+            print("Unwrap initiated successfully")
+            return response.json()
+        else:
+            print(f"Failed to initiate unwrap. Status code: {response.status_code}")
+            print(f"Response content: {response.text}")
+            return None
+    
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred while sending the request to the server: {e}")
+        return None
+
 if __name__ == "__main__":
-    wallet_name = "default"
-    recipient_address = os.getenv('BRIDGE_BTC_ADDRESS')
-    ethereum_address = os.getenv('WBTC_RECEIVE_ADDRESS')
-    amount_to_send = 0.61  # BTC
-    server_url = "http://localhost:8000/initiate-wrap"
-    btc_node_url = os.getenv('BTC_NODE_URL')
-    print(f"recipient_address: {recipient_address}")
-    print(f"amount_to_send: {amount_to_send}")
-    print(f"server_url: {server_url}")
-    print(f"btc_node_url: {btc_node_url}")
-    print(f"wallet_name: {wallet_name}")
-    result = create_and_send_btc_transaction(recipient_address, amount_to_send, server_url, ethereum_address)
-    if result:
-        print("Server response:", result)
+    parser = argparse.ArgumentParser(description="WBTC Wrap/Unwrap Client")
+    parser.add_argument('action', choices=['wrap', 'unwrap'], help="Action to perform: wrap or unwrap")
+    parser.add_argument('--amount', type=float, required=True, help="Amount of BTC to wrap or WBTC to unwrap")
+    
+    args = parser.parse_args()
+
+    load_dotenv()
+    server_url = "http://localhost:8000"
+    
+    if args.action == 'wrap':
+        recipient_address = os.getenv('BRIDGE_BTC_ADDRESS')
+        ethereum_address = os.getenv('WBTC_RECEIVE_ADDRESS')
+        amount_to_send = args.amount
+        result = create_and_send_btc_transaction(recipient_address, amount_to_send, f"{server_url}/initiate-wrap", ethereum_address)
+        if result:
+            print("Wrap initiated. Server response:", result)
+    
+    elif args.action == 'unwrap':
+        eth_address = os.getenv('WBTC_RECEIVE_ADDRESS')
+        btc_address = os.getenv('BTC_RECEIVE_ADDRESS')
+        wbtc_amount = args.amount
+        result = initiate_unwrap(eth_address, btc_address, wbtc_amount, server_url)
+        if result:
+            print("Unwrap initiated. Server response:", result)
