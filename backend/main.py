@@ -482,15 +482,15 @@ def process_unwrap_transaction(unwrap_id: int):
             return
 
         if unwrap_tx.status == UnwrapStatus.APPROVED:
-            burn_wbtc(unwrap_tx)
+            burn_wbtc(unwrap_id)
         elif unwrap_tx.status == UnwrapStatus.BURNING:
-            check_burn_transaction(unwrap_tx)
+            check_burn_transaction(unwrap_id)
         elif unwrap_tx.status == UnwrapStatus.BURNED:
-            create_btc_transaction(unwrap_tx)
+            create_btc_transaction(unwrap_id)
         elif unwrap_tx.status == UnwrapStatus.BTC_TRANSFER_READY:
-            broadcast_btc_transaction(unwrap_tx)
+            broadcast_btc_transaction(unwrap_id)
         elif unwrap_tx.status == UnwrapStatus.BTC_TRANSFER_BROADCASTED:
-            check_btc_transaction(unwrap_tx)
+            check_btc_transaction(unwrap_id)
 
     except Exception as e:
         logger.error(f"Error processing unwrap transaction {unwrap_id}: {str(e)}")
@@ -501,12 +501,12 @@ def process_unwrap_transaction(unwrap_id: int):
     finally:
         db.close()
 
-def burn_wbtc(unwrap_tx: UnwrapTransaction):
-    logger.info(f"Burning WBTC for unwrap transaction: {unwrap_tx.id}")
+def burn_wbtc(unwrap_tx_id: int):
+    logger.info(f"Burning WBTC for unwrap transaction: {unwrap_tx_id}")
     db = SessionLocal()
     try:
         # Fetch the latest transaction data
-        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx.id).with_for_update().first()
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx_id).with_for_update().first()
         if not unwrap_tx or unwrap_tx.status != UnwrapStatus.APPROVED:
             logger.warning(f"Invalid unwrap transaction state for burning: {unwrap_tx.id}")
             return
@@ -527,7 +527,7 @@ def burn_wbtc(unwrap_tx: UnwrapTransaction):
         
         # Sign and send the transaction
         signed_tx = w3.eth.account.sign_transaction(burn_tx, os.getenv('OWNER_PRIVATE_KEY'))
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         
         # Update the transaction status and eth_tx_hash
         unwrap_tx.status = UnwrapStatus.BURNING
@@ -545,12 +545,12 @@ def burn_wbtc(unwrap_tx: UnwrapTransaction):
     finally:
         db.close()
 
-def check_burn_transaction(unwrap_tx: UnwrapTransaction):
-    logger.info(f"Checking burn transaction for unwrap: {unwrap_tx.id}")
+def check_burn_transaction(unwrap_tx_id: int):
+    logger.info(f"Checking burn transaction for unwrap: {unwrap_tx_id}")
     db = SessionLocal()
     try:
         # Fetch the latest transaction data
-        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx.id).with_for_update().first()
+        unwrap_tx = db.query(UnwrapTransaction).filter(UnwrapTransaction.id == unwrap_tx_id).with_for_update().first()
         if not unwrap_tx or unwrap_tx.status != UnwrapStatus.BURNING:
             logger.warning(f"Invalid unwrap transaction state for checking burn: {unwrap_tx.id}")
             return
@@ -598,16 +598,18 @@ def create_btc_transaction(unwrap_tx_id: int):
         # Load the Bitcoin wallet
         btc_rpc = load_btc_wallet()
 
-        # Get the bridge's Bitcoin address
         bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
-
-        # Calculate the amount to send
         amount_to_send = Decimal(str(unwrap_tx.btc_amount))
         fee = Decimal(str(unwrap_tx.btc_fee))
+        total_needed = amount_to_send + fee
 
-        # Create a raw transaction
-        inputs = btc_rpc.listunspent(0, 9999999, [bridge_address])
-        if not inputs:
+        # Fetch unspent UTXOs with minimum amount and sum
+        unspent = btc_rpc.listunspent(0, 9999999, [bridge_address], False, {
+            "minimumAmount": "0.00000546",
+            "minimumSumAmount": float(total_needed)
+        })
+        
+        if not unspent:
             logger.error("No unspent transactions found")
             raise Exception("No unspent transactions found")
 

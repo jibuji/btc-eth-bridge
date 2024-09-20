@@ -11,7 +11,12 @@ contract WBTC is ERC20, Ownable {
         _mint(to, amount);
     }
 
-    function burn(address from, uint256 amount) external onlyOwner {
-        _burn(from, amount);
+    event TokensBurned(address indexed from, uint256 amount, bytes data);
+
+    function burn(uint256 amount, bytes calldata data) external {
+        _burn(msg.sender, amount);
+        
+        // Emit an event with the attached data
+        emit TokensBurned(msg.sender, amount, data);
     }
 }
