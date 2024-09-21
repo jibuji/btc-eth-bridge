@@ -277,24 +277,39 @@ async def process_unwrap_transactions():
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
     
     for tx in initiated_txs:
-        # Check Ethereum transaction confirmation
         try:
             eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
             if eth_tx_receipt and eth_tx_receipt['status'] == 1:
-                # Transaction is mined, now we can safely decode and extract information
                 eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
                 calldata = eth_tx['input']
-                match = re.search(b'wrp:[^\\x00]+', calldata)
-                if match:
-                    decoded_calldata = match.group().decode('utf-8')
-                    wallet_id, btc_receiving_address = decoded_calldata.split(':')[1].split('-')
-                    amount = eth_tx['value']
+                print("calldata:", calldata)
+                
+                # Get the function signature (first 4 bytes of the calldata)
+                func_signature = calldata[:4]
+                burn_signature = w3.keccak(text="burn(uint256,bytes)")[:4]
+                print(f"Extracted function signature: {func_signature}")
+                print(f"Expected burn function signature: {burn_signature}")
+                
+                if func_signature == burn_signature:
+                    # Decode the burn function parameters
+                    decoded_input = compiled_sol.decode_function_input(calldata)
+                    print("decoded_input:", decoded_input)
+                    print("decoded_input[1]:", decoded_input[1])
+                    burnt_amount = decoded_input[1]['amount']
+                    print("burnt_amount:", burnt_amount)
+                    
+                    # Extract wallet_id and btc_receiving_address from the _data parameter
+                    data_param = decoded_input[1]['data'].decode('utf-8')
+                    wallet_id, btc_receiving_address = data_param.split(':')[1].split('-')
 
                     # Update the database record with extracted information
                     tx.wallet_id = wallet_id
                     tx.btc_receiving_address = btc_receiving_address
-                    tx.amount = w3.from_wei(amount, 'ether')  # Convert from Wei to Ether
+                    tx.amount = burnt_amount/100000000  # Convert from Wei to Ether
                     tx.status = "CONFIRMED"
+                else:
+                    logger.error(f"Unexpected function call: {func_signature}")
+                    continue
 
         except Exception as e:
             print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
@@ -373,7 +388,7 @@ async def process_unwrap_transactions():
 
 # Add jobs to the scheduler
 scheduler.add_job(process_wrap_transactions, IntervalTrigger(minutes=2))
-scheduler.add_job(process_unwrap_transactions, IntervalTrigger(minutes=2))
+scheduler.add_job(process_unwrap_transactions, IntervalTrigger(minutes=1))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
