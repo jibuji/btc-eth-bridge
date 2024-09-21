@@ -14,6 +14,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 import uvicorn
 import asyncio
 import binascii
+import time
+from bitcoinrpc.authproxy import JSONRPCException
+
 load_dotenv()
 
 # Create an AsyncIOScheduler
@@ -58,7 +61,9 @@ except Exception as e:
     print(f"Failed to load wallet: {e}")
 
 # Instead of creating a new AuthServiceProxy, update the existing one
-rpc_connection._url = f"{btc_node_url}/wallet/{btc_wallet_name}"
+btc_node_wallet_url = f"{btc_node_url}/wallet/{btc_wallet_name}"
+
+
 
 # Database setup
 engine = create_engine(os.getenv("DATABASE_URL"))
@@ -97,6 +102,7 @@ class UnwrapRequest(BaseModel):
 async def initiate_wrap(wrap_request: WrapRequest):
     try:
         print("received signed btc tx:", wrap_request.signed_btc_tx)
+        rpc_connection = AuthServiceProxy(btc_node_wallet_url)
         # Decode and extract information from the signed Bitcoin transaction
         decoded_tx = rpc_connection.decoderawtransaction(wrap_request.signed_btc_tx)
         print("decoded tx:", decoded_tx)
@@ -200,45 +206,76 @@ async def unwrap_history(wallet_id: str):
     return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount} for tx in unwrap_txs]
 
 # Background tasks (to be run periodically)
+
+
 async def process_wrap_transactions():
-    session = Session()
-    broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == "BROADCASTED").all()
+    max_retries = 3
+    retry_delay = 5  # seconds
+    rpc_connection = AuthServiceProxy(btc_node_wallet_url)
+    for attempt in range(max_retries):
+        try:
+            session = Session()
+            broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == "BROADCASTED").all()
 
-    for tx in broadcasted_txs:
-        # Check Bitcoin transaction confirmation
-        btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-        if btc_tx['confirmations'] >= 6:
-            # Mint WBTC
-            nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
-            mint_tx = compiled_sol.functions.mint(tx.receiving_address, tx.amount).build_transaction({
-                'chainId': 1,
-                'gas': 2000000,
-                'gasPrice': w3.eth.gas_price,
-                'nonce': nonce,
-            })
-            signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
-            eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            for tx in broadcasted_txs:
+                # Check Bitcoin transaction confirmation
+                try:
+                    btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
+                    if btc_tx['confirmations'] >= 6:
+                        # Convert BTC amount to satoshis, then to Wei
+                        satoshis = int(tx.amount * 100000000)  # 1 BTC = 100,000,000 satoshis
+                        wei_amount = Web3.to_wei(satoshis, 'wei')  # 1 WBTC = 1e8 wei (same as 1 satoshi)
 
-            tx.status = "MINTING"
-            tx.eth_tx_hash = eth_tx_hash.hex()
+                        # Mint WBTC
+                        nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
+                        chain_id = w3.eth.chain_id  # Get the current chain ID
+                        mint_tx = compiled_sol.functions.mint(tx.receiving_address, wei_amount).build_transaction({
+                            'chainId': chain_id,
+                            'gas': 2000000,
+                            'gasPrice': w3.eth.gas_price,
+                            'nonce': nonce,
+                        })
+                        signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
+                        eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-    session.commit()
+                        tx.status = "MINTING"
+                        tx.eth_tx_hash = eth_tx_hash.hex()
+                except JSONRPCException as e:
+                    print(f"JSONRPC error for transaction {tx.btc_tx_id}: {e}")
+                    continue
 
-    minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == "MINTING").all()
+            session.commit()
 
-    for tx in minting_txs:
-        # Check WBTC minting transaction confirmation
-        eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
-        if eth_tx and eth_tx['status'] == 1:
-            tx.status = "COMPLETED"
+            minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == "MINTING").all()
 
-    session.commit()
-    session.close()
+            for tx in minting_txs:
+                # Check WBTC minting transaction confirmation
+                eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
+                if eth_tx and eth_tx['status'] == 1:
+                    tx.status = "COMPLETED"
+
+            session.commit()
+            session.close()
+            break  # If we get here, the function completed successfully
+
+        except (BrokenPipeError, ConnectionError) as e:
+            print(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("Max retries reached. Please check your Bitcoin node connection.")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            break
+        finally:
+            if 'session' in locals():
+                session.close()
 
 async def process_unwrap_transactions():
     session = Session()
     initiated_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "INITIATED").all()
-
+    rpc_connection = AuthServiceProxy(btc_node_wallet_url)
     for tx in initiated_txs:
         # Check Ethereum transaction confirmation
         eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)

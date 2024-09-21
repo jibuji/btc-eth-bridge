@@ -101,10 +101,10 @@ def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_addres
         }
         
         # Sign transaction
-        signed_txn = w3.eth.account.sign_transaction(transaction, os.getenv("ETH_PRIVATE_KEY"))
+        signed_txn = w3.eth.account.sign_transaction(transaction, os.getenv("ETH_SENDER_PRIVATE_KEY"))
         
         # Send signed transaction to server
-        response = requests.post(f"{SERVER_URL}/initiate-unwrap/", json={'signed_eth_tx': signed_txn.rawTransaction.hex()})
+        response = requests.post(f"{SERVER_URL}/initiate-unwrap/", json={'signed_eth_tx': signed_txn.raw_transaction.hex()})
         
         if response.status_code == 200:
             print("Unwrap transaction sent successfully to the server")
