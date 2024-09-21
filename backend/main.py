@@ -69,6 +69,7 @@ except Exception as e:
 # Instead of creating a new AuthServiceProxy, update the existing one
 btc_node_wallet_url = f"{btc_node_url}/wallet/{btc_wallet_name}"
 
+bridge_btc_address = os.getenv('BRIDGE_BTC_ADDRESS')
 
 
 # Database setup
@@ -122,8 +123,9 @@ async def initiate_wrap(wrap_request: WrapRequest):
         wallet_id, receiving_address = op_return_data.split(':')[1].split('-')
         print("wallet id:", wallet_id)
         print("receiving address:", receiving_address)
-        amount = sum(output['value'] for output in decoded_tx['vout'] if output['scriptPubKey']['type'] != 'nulldata')
-
+        amount = sum(output['value'] for output in decoded_tx['vout'] 
+                     if output['scriptPubKey'].get('address') == bridge_btc_address)
+        print(f"Amount sent to bridge address: {amount} BTC")
         # Broadcast the transaction
         btc_tx_id = rpc_connection.sendrawtransaction(wrap_request.signed_btc_tx)
 
@@ -335,6 +337,8 @@ async def process_unwrap_transactions():
                 tx.btc_receiving_address: float(amount_to_send),
                 bridge_address: float(total_amount - total_needed)  # Change
             }
+
+            print("tx_outputs:", tx_outputs)
             # Format OP_RETURN data as hexadecimal
             op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTC_RECEIVE_ADDRESS')}"
             op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
