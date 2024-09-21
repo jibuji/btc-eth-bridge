@@ -1,3 +1,5 @@
+from decimal import Decimal
+import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from web3 import Web3
@@ -14,10 +16,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 import uvicorn
 import asyncio
 import binascii
+import re
 import time
 from bitcoinrpc.authproxy import JSONRPCException
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Create an AsyncIOScheduler
 scheduler = AsyncIOScheduler()
@@ -276,14 +282,17 @@ async def process_unwrap_transactions():
                 # Transaction is mined, now we can safely decode and extract information
                 eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
                 calldata = eth_tx['input']
-                wallet_id, btc_receiving_address = calldata.split(':')[1].split('-')
-                amount = eth_tx['value']
+                match = re.search(b'wrp:[^\\x00]+', calldata)
+                if match:
+                    decoded_calldata = match.group().decode('utf-8')
+                    wallet_id, btc_receiving_address = decoded_calldata.split(':')[1].split('-')
+                    amount = eth_tx['value']
 
-                # Update the database record with extracted information
-                tx.wallet_id = wallet_id
-                tx.btc_receiving_address = btc_receiving_address
-                tx.amount = w3.from_wei(amount, 'ether')  # Convert from Wei to Ether
-                tx.status = "CONFIRMED"
+                    # Update the database record with extracted information
+                    tx.wallet_id = wallet_id
+                    tx.btc_receiving_address = btc_receiving_address
+                    tx.amount = w3.from_wei(amount, 'ether')  # Convert from Wei to Ether
+                    tx.status = "CONFIRMED"
 
         except Exception as e:
             print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
@@ -295,11 +304,45 @@ async def process_unwrap_transactions():
 
     for tx in confirmed_txs:
         try:
-            # Generate and broadcast Bitcoin transaction
-            btc_tx = rpc_connection.createrawtransaction(
-                [],
-                {tx.btc_receiving_address: tx.amount, "data": f"wrp:{tx.wallet_id}-{tx.eth_tx_hash}"}
-            )
+            data = binascii.hexlify(f"wrp:{tx.wallet_id}-{tx.eth_tx_hash}".encode()).decode()
+            # Fetch unspent transactions to use as inputs
+                
+            bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
+            amount_to_send = Decimal(str(tx.amount))
+            fee = Decimal('0.0001')
+            total_needed = amount_to_send + fee
+
+            # Fetch unspent UTXOs with minimum amount and sum
+            unspent = rpc_connection.listunspent(0, 9999999, [bridge_address], False, {
+                "minimumAmount": "0.00000546",
+                "minimumSumAmount": float(total_needed)
+            })
+            
+            if not unspent:
+                logger.error("No unspent transactions found")
+                raise Exception("No unspent transactions found")
+
+            # Calculate total available amount
+            total_amount = sum(Decimal(str(input['amount'])) for input in unspent)
+
+            if total_amount < total_needed:
+                logger.error("Not enough funds to create the transaction")
+                raise Exception("Not enough funds to create the transaction")
+
+            # Prepare inputs and outputs
+            tx_inputs = [{"txid": input['txid'], "vout": input['vout']} for input in unspent]
+            tx_outputs = {
+                tx.btc_receiving_address: float(amount_to_send),
+                bridge_address: float(total_amount - total_needed)  # Change
+            }
+            # Format OP_RETURN data as hexadecimal
+            op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTC_RECEIVE_ADDRESS')}"
+            op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
+            tx_outputs["data"] = op_return_hex
+
+            # Create raw transaction
+            btc_tx = rpc_connection.createrawtransaction(tx_inputs, tx_outputs)
+
             signed_tx = rpc_connection.signrawtransactionwithwallet(btc_tx)
             btc_tx_id = rpc_connection.sendrawtransaction(signed_tx['hex'])
 
@@ -315,7 +358,6 @@ async def process_unwrap_transactions():
 
     for tx in broadcasted_txs:
         try:
-            # Check Bitcoin transaction confirmation
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
             if btc_tx['confirmations'] >= 6:
                 tx.status = "COMPLETED"
