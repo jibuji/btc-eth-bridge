@@ -84,11 +84,11 @@ class UnwrapTransaction(Base):
     __tablename__ = "unwrap_transactions"
     id = Column(Integer, primary_key=True, index=True)
     eth_tx_hash = Column(String, unique=True, index=True)
-    wallet_id = Column(String, index=True)
-    btc_receiving_address = Column(String)
-    amount = Column(Float)
+    wallet_id = Column(String, index=True, nullable=True)
+    btc_receiving_address = Column(String, nullable=True)
+    amount = Column(Float, nullable=True)
     status = Column(String)
-    btc_tx_id = Column(String)
+    btc_tx_id = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -141,22 +141,13 @@ async def initiate_wrap(wrap_request: WrapRequest):
 @app.post("/initiate-unwrap/")
 async def initiate_unwrap(unwrap_request: UnwrapRequest):
     try:
-        # Decode and extract information from the signed Ethereum transaction
-        decoded_tx = w3.eth.account.decode_transaction(unwrap_request.signed_eth_tx)
-        calldata = decoded_tx['data']
-        wallet_id, btc_receiving_address = calldata.split(':')[1].split('-')
-        amount = decoded_tx['value']
-
-        # Broadcast the transaction
+        # Broadcast the transaction without decoding
         eth_tx_hash = w3.eth.send_raw_transaction(unwrap_request.signed_eth_tx)
 
-        # Create a database record
+        # Create a database record with minimal information
         session = Session()
         new_unwrap = UnwrapTransaction(
             eth_tx_hash=eth_tx_hash.hex(),
-            wallet_id=wallet_id,
-            btc_receiving_address=btc_receiving_address,
-            amount=amount,
             status="INITIATED"
         )
         session.add(new_unwrap)
@@ -276,10 +267,34 @@ async def process_unwrap_transactions():
     session = Session()
     initiated_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "INITIATED").all()
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
+    
     for tx in initiated_txs:
         # Check Ethereum transaction confirmation
-        eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
-        if eth_tx and eth_tx['status'] == 1:
+        try:
+            eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
+            if eth_tx_receipt and eth_tx_receipt['status'] == 1:
+                # Transaction is mined, now we can safely decode and extract information
+                eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
+                calldata = eth_tx['input']
+                wallet_id, btc_receiving_address = calldata.split(':')[1].split('-')
+                amount = eth_tx['value']
+
+                # Update the database record with extracted information
+                tx.wallet_id = wallet_id
+                tx.btc_receiving_address = btc_receiving_address
+                tx.amount = w3.from_wei(amount, 'ether')  # Convert from Wei to Ether
+                tx.status = "CONFIRMED"
+
+        except Exception as e:
+            print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            continue
+
+    session.commit()
+
+    confirmed_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "CONFIRMED").all()
+
+    for tx in confirmed_txs:
+        try:
             # Generate and broadcast Bitcoin transaction
             btc_tx = rpc_connection.createrawtransaction(
                 [],
@@ -291,15 +306,21 @@ async def process_unwrap_transactions():
             tx.status = "BROADCASTED"
             tx.btc_tx_id = btc_tx_id
 
+        except Exception as e:
+            print(f"Error creating Bitcoin transaction for {tx.eth_tx_hash}: {e}")
+
     session.commit()
 
     broadcasted_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "BROADCASTED").all()
 
     for tx in broadcasted_txs:
-        # Check Bitcoin transaction confirmation
-        btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-        if btc_tx['confirmations'] >= 6:
-            tx.status = "COMPLETED"
+        try:
+            # Check Bitcoin transaction confirmation
+            btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
+            if btc_tx['confirmations'] >= 6:
+                tx.status = "COMPLETED"
+        except Exception as e:
+            print(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
 
     session.commit()
     session.close()

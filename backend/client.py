@@ -6,13 +6,22 @@ from dotenv import load_dotenv
 import os
 from decimal import Decimal
 import binascii
+import json
 
 load_dotenv()
 
 # Ethereum setup
 w3 = Web3(Web3.HTTPProvider(os.getenv("ETH_NODE_URL")))
+wbtc_address = os.getenv("WBTC_ADDRESS")
 
-# Bitcoin setup
+# Read the ABI from a JSON file
+abi_file_path = "../artifacts/contracts/WBTC.sol/WBTC.json"
+with open(abi_file_path, "r") as file:
+    contract_abi = json.load(file)['abi']
+
+# Create the contract instance
+wbtc_contract = w3.eth.contract(address=wbtc_address, abi=contract_abi)
+
 # Bitcoin setup
 btc_node_url = os.getenv("BTC_NODE_URL")
 btc_wallet_name = os.getenv('TEST_BTC_WALLET_NAME')
@@ -26,8 +35,6 @@ except Exception as e:
 
 # Instead of creating a new AuthServiceProxy, update the existing one
 rpc_connection = AuthServiceProxy(f"{btc_node_url}/wallet/{btc_wallet_name}")
-
-
 
 SERVER_URL = "http://localhost:8000"
 
@@ -85,20 +92,27 @@ def create_and_send_btc_transaction(recipient_address, amount_btc, wallet_id):
 def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_address):
     try:
         nonce = w3.eth.get_transaction_count(os.getenv("ETH_SENDER_ADDRESS"))
-        wbtc_contract_address = os.getenv("WBTC_ADDRESS")
         
-        # Convert WBTC amount to Wei
-        amount_in_wei = w3.to_wei(wbtc_amount, 'ether')
+        # Get the current chain ID
+        chain_id = w3.eth.chain_id
+
+        satoshis = int(wbtc_amount * 100000000)  # 1 BTC = 100,000,000 satoshis
+        amount_in_wei = Web3.to_wei(satoshis, 'wei')  # 1 WBTC = 1e8 wei (same as 1 satoshi)
+
+        print("amount_in_wei:", amount_in_wei)
+        # Prepare the custom data
+        custom_data = f"wrp:{wallet_id}-{btc_receiving_address}".encode('utf-8')
+        print("custom_data:", custom_data)
+        # Prepare the burn function call with both arguments
+        burn_function = wbtc_contract.functions.burn(amount_in_wei, custom_data)
         
-        # Create transaction
-        transaction = {
-            'nonce': nonce,
-            'to': wbtc_contract_address,
-            'value': amount_in_wei,
+        # Prepare transaction data
+        transaction = burn_function.build_transaction({
+            'chainId': chain_id,
             'gas': 2000000,
             'gasPrice': w3.eth.gas_price,
-            'data': f"wrp:{wallet_id}-{btc_receiving_address}".encode('utf-8')
-        }
+            'nonce': nonce,
+        })
         
         # Sign transaction
         signed_txn = w3.eth.account.sign_transaction(transaction, os.getenv("ETH_SENDER_PRIVATE_KEY"))
