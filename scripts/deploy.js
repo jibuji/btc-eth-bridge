@@ -1,7 +1,9 @@
 require('dotenv').config();
-const { ethers } = require("hardhat");
+const { ethers, run } = require("hardhat");
 
 async function main() {
+    // Compile the contracts
+    await run('compile');
     // Get the private key from the .env file
     const privateKey = process.env.PRIVATE_KEY;
     if (!privateKey) {

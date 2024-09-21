@@ -1,55 +1,41 @@
 import argparse
-from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
+from web3 import Web3
+from bitcoinrpc.authproxy import AuthServiceProxy
 import requests
 from dotenv import load_dotenv
 import os
 from decimal import Decimal
+import binascii
 
-# Load environment variables from .env file
 load_dotenv()
 
-btc_rpc = None
-BTC_WALLET_NAME = "default"
+# Ethereum setup
+w3 = Web3(Web3.HTTPProvider(os.getenv("ETH_NODE_URL")))
 
-def load_btc_wallet():
-    global btc_rpc
+# Bitcoin setup
+# Bitcoin setup
+btc_node_url = os.getenv("BTC_NODE_URL")
+btc_wallet_name = os.getenv('TEST_BTC_WALLET_NAME')
+
+rpc_connection = AuthServiceProxy(btc_node_url)
+# Load the wallet
+try:
+    rpc_connection.loadwallet(btc_wallet_name)
+except Exception as e:
+    print(f"Failed to load wallet: {e}")
+
+# Instead of creating a new AuthServiceProxy, update the existing one
+rpc_connection = AuthServiceProxy(f"{btc_node_url}/wallet/{btc_wallet_name}")
+
+
+
+SERVER_URL = "http://localhost:8000"
+
+def create_and_send_btc_transaction(recipient_address, amount_btc, wallet_id):
     try:
-        base_url = os.getenv('BTC_NODE_URL')
-        btc_rpc = AuthServiceProxy(base_url)
-        
-        wallet_info = btc_rpc.listwalletdir()
-        wallet_exists = any(wallet['name'] == BTC_WALLET_NAME for wallet in wallet_info['wallets'])
-        
-        if not wallet_exists:
-            btc_rpc.createwallet(BTC_WALLET_NAME)
-        else:
-            try:
-                btc_rpc.loadwallet(BTC_WALLET_NAME)
-            except JSONRPCException as e:
-                if "already loaded" not in str(e):
-                    raise
-        
-        wallet_url = f"{base_url}/wallet/{BTC_WALLET_NAME}"
-        btc_rpc = AuthServiceProxy(wallet_url)
-        btc_rpc.getwalletinfo()  # Test the connection
-        
-    except JSONRPCException as e:
-        print(f"Error loading wallet: {str(e)}")
-        raise
-
-# Load the wallet before starting the server
-load_btc_wallet()
-
-def create_and_send_btc_transaction(recipient_address, amount_btc, server_url, ethereum_address):
-    try:
-        # Convert amount_btc to Decimal
         amount_btc = Decimal(str(amount_btc))
-        
-        # Get unspent outputs and sort them by amount in descending order
-        unspent = sorted(btc_rpc.listunspent(0, 9999999), key=lambda x: x['amount'], reverse=True)
-        
-        # Calculate fee (you may need to adjust this based on your network's current fee rate)
-        fee = Decimal('0.0001')  # Set a reasonable fee, adjust as needed
+        unspent = sorted(rpc_connection.listunspent(0, 9999999), key=lambda x: x['amount'], reverse=True)
+        fee = Decimal('0.0001')
         
         total_amount = Decimal('0')
         inputs = []
@@ -63,92 +49,162 @@ def create_and_send_btc_transaction(recipient_address, amount_btc, server_url, e
             print(f"Insufficient funds. Available: {total_amount}, Required: {amount_btc + fee}")
             return None
         
-        print(f"total_amount: {total_amount}")
-        print(f"amount_btc: {amount_btc}")
-        print(f"fee: {fee}")
-        print(f"inputs: {inputs}")
-        # Create outputs
+        change_address = rpc_connection.getrawchangeaddress()
         outputs = {
-            recipient_address: float(amount_btc),  # Convert back to float for Bitcoin Core
-            btc_rpc.getrawchangeaddress(): float(total_amount - amount_btc - fee)  # Convert back to float
+            recipient_address: float(amount_btc),
+            change_address: float(total_amount - amount_btc - fee)
         }
-        print(f"outputs: {outputs}")
         
-        # Create raw transaction
-        raw_tx = btc_rpc.createrawtransaction(inputs, outputs)
+        # Format OP_RETURN data as hexadecimal
+        op_return_data = f"wrp:{wallet_id}-{os.getenv('WBTC_RECEIVE_ADDRESS')}"
+        op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
+        outputs["data"] = op_return_hex
         
-        # Sign the raw transaction
-        signed_tx = btc_rpc.signrawtransactionwithwallet(raw_tx)
+        raw_tx = rpc_connection.createrawtransaction(inputs, outputs)
+        signed_tx = rpc_connection.signrawtransactionwithwallet(raw_tx)
         
         if signed_tx["complete"]:
-            # Get the raw signed transaction
             signed_tx_hex = signed_tx["hex"]
-            print(f"signed_tx_hex: {signed_tx_hex}")
-            print(f"ethereum_address: {ethereum_address}")  
-            # Send the signed transaction to the server
-            response = requests.post(server_url, json={'signed_btc_tx': signed_tx_hex, 'ethereum_address': ethereum_address})
+            response = requests.post(f"{SERVER_URL}/initiate-wrap/", json={'signed_btc_tx': signed_tx_hex})
             
             if response.status_code == 200:
-                print("Transaction sent successfully to the server")
+                print("Wrap transaction sent successfully to the server")
                 return response.json()
             else:
-                print(f"Failed to send transaction. Status code: {response.status_code}")
+                print(f"Failed to send wrap transaction. Status code: {response.status_code}")
                 print(f"Response content: {response.text}")
                 return None
         else:
             print("Failed to sign the transaction")
             return None
     
-    except JSONRPCException as e:
-        print(f"An error occurred with the Bitcoin RPC: {e}")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"An error occurred while sending the request to the server: {e}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
         return None
 
-def initiate_unwrap(eth_address, btc_address, wbtc_amount, server_url):
+def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_address):
     try:
-        payload = {
-            'eth_address': eth_address,
-            'btc_address': btc_address,
-            'wbtc_amount': wbtc_amount
+        nonce = w3.eth.get_transaction_count(os.getenv("ETH_SENDER_ADDRESS"))
+        wbtc_contract_address = os.getenv("WBTC_ADDRESS")
+        
+        # Convert WBTC amount to Wei
+        amount_in_wei = w3.to_wei(wbtc_amount, 'ether')
+        
+        # Create transaction
+        transaction = {
+            'nonce': nonce,
+            'to': wbtc_contract_address,
+            'value': amount_in_wei,
+            'gas': 2000000,
+            'gasPrice': w3.eth.gas_price,
+            'data': f"wrp:{wallet_id}-{btc_receiving_address}".encode('utf-8')
         }
-        response = requests.post(f"{server_url}/initiate-unwrap", json=payload)
+        
+        # Sign transaction
+        signed_txn = w3.eth.account.sign_transaction(transaction, os.getenv("ETH_PRIVATE_KEY"))
+        
+        # Send signed transaction to server
+        response = requests.post(f"{SERVER_URL}/initiate-unwrap/", json={'signed_eth_tx': signed_txn.rawTransaction.hex()})
         
         if response.status_code == 200:
-            print("Unwrap initiated successfully")
+            print("Unwrap transaction sent successfully to the server")
             return response.json()
         else:
-            print(f"Failed to initiate unwrap. Status code: {response.status_code}")
+            print(f"Failed to send unwrap transaction. Status code: {response.status_code}")
             print(f"Response content: {response.text}")
             return None
     
-    except requests.exceptions.RequestException as e:
-        print(f"An error occurred while sending the request to the server: {e}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+def check_wrap_status(btc_tx_id):
+    response = requests.get(f"{SERVER_URL}/wrap-status/{btc_tx_id}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to get wrap status. Status code: {response.status_code}")
+        return None
+
+def check_unwrap_status(eth_tx_hash):
+    response = requests.get(f"{SERVER_URL}/unwrap-status/{eth_tx_hash}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to get unwrap status. Status code: {response.status_code}")
+        return None
+
+def get_wrap_history(wallet_id):
+    response = requests.get(f"{SERVER_URL}/wrap-history/{wallet_id}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to get wrap history. Status code: {response.status_code}")
+        return None
+
+def get_unwrap_history(wallet_id):
+    response = requests.get(f"{SERVER_URL}/unwrap-history/{wallet_id}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to get unwrap history. Status code: {response.status_code}")
         return None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WBTC Wrap/Unwrap Client")
-    parser.add_argument('action', choices=['wrap', 'unwrap'], help="Action to perform: wrap or unwrap")
-    parser.add_argument('--amount', type=float, required=True, help="Amount of BTC to wrap or WBTC to unwrap")
+    parser.add_argument('action', choices=['wrap', 'unwrap', 'wrap-status', 'unwrap-status', 'wrap-history', 'unwrap-history'], help="Action to perform")
+    parser.add_argument('--amount', type=float, help="Amount of BTC to wrap or WBTC to unwrap")
+    parser.add_argument('--wallet-id', type=str, help="Wallet ID for the transaction")
+    parser.add_argument('--tx-id', type=str, help="Transaction ID for status check")
     
     args = parser.parse_args()
 
-    load_dotenv()
-    server_url = "http://localhost:8000"
-    
     if args.action == 'wrap':
-        recipient_address = os.getenv('BRIDGE_BTC_ADDRESS')
-        ethereum_address = os.getenv('WBTC_RECEIVE_ADDRESS')
-        amount_to_send = args.amount
-        result = create_and_send_btc_transaction(recipient_address, amount_to_send, f"{server_url}/initiate-wrap", ethereum_address)
-        if result:
-            print("Wrap initiated. Server response:", result)
+        if not args.amount or not args.wallet_id:
+            print("Please provide --amount and --wallet-id for wrap action")
+        else:
+            recipient_address = os.getenv('BRIDGE_BTC_ADDRESS')
+            result = create_and_send_btc_transaction(recipient_address, args.amount, args.wallet_id)
+            if result:
+                print("Wrap initiated. Server response:", result)
     
     elif args.action == 'unwrap':
-        eth_address = os.getenv('WBTC_RECEIVE_ADDRESS')
-        btc_address = os.getenv('BTC_RECEIVE_ADDRESS')
-        wbtc_amount = args.amount
-        result = initiate_unwrap(eth_address, btc_address, wbtc_amount, server_url)
-        if result:
-            print("Unwrap initiated. Server response:", result)
+        if not args.amount or not args.wallet_id:
+            print("Please provide --amount and --wallet-id for unwrap action")
+        else:
+            btc_receiving_address = os.getenv('BTC_RECEIVE_ADDRESS')
+            result = create_and_send_eth_transaction(args.amount, args.wallet_id, btc_receiving_address)
+            if result:
+                print("Unwrap initiated. Server response:", result)
+    
+    elif args.action == 'wrap-status':
+        if not args.tx_id:
+            print("Please provide --tx-id for wrap-status action")
+        else:
+            status = check_wrap_status(args.tx_id)
+            if status:
+                print("Wrap status:", status)
+    
+    elif args.action == 'unwrap-status':
+        if not args.tx_id:
+            print("Please provide --tx-id for unwrap-status action")
+        else:
+            status = check_unwrap_status(args.tx_id)
+            if status:
+                print("Unwrap status:", status)
+    
+    elif args.action == 'wrap-history':
+        if not args.wallet_id:
+            print("Please provide --wallet-id for wrap-history action")
+        else:
+            history = get_wrap_history(args.wallet_id)
+            if history:
+                print("Wrap history:", history)
+    
+    elif args.action == 'unwrap-history':
+        if not args.wallet_id:
+            print("Please provide --wallet-id for unwrap-history action")
+        else:
+            history = get_unwrap_history(args.wallet_id)
+            if history:
+                print("Unwrap history:", history)

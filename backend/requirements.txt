@@ -7,3 +7,12 @@
    python-bitcoinrpc
    apscheduler
    pydantic
+   bitcoin
+   tenacity
+   requests
+   typing
+   urllib
+   http
+   atexit
+   logging
+   
