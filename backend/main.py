@@ -1,5 +1,6 @@
 from decimal import Decimal
 import logging
+import math
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from web3 import Web3
@@ -19,6 +20,8 @@ import binascii
 import re
 import time
 from bitcoinrpc.authproxy import JSONRPCException
+
+MIN_AMOUNT = 100
 
 load_dotenv()
 
@@ -126,6 +129,9 @@ async def initiate_wrap(wrap_request: WrapRequest):
         amount = sum(output['value'] for output in decoded_tx['vout'] 
                      if output['scriptPubKey'].get('address') == bridge_btc_address)
         print(f"Amount sent to bridge address: {amount} BTC")
+        if amount < MIN_AMOUNT:
+            raise Exception(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC")
+        
         # Broadcast the transaction
         btc_tx_id = rpc_connection.sendrawtransaction(wrap_request.signed_btc_tx)
 
@@ -297,7 +303,13 @@ async def process_unwrap_transactions():
                     print("decoded_input[1]:", decoded_input[1])
                     burnt_amount = decoded_input[1]['amount']
                     print("burnt_amount:", burnt_amount)
-                    
+                    amount = burnt_amount/100000000
+                    # check if amount is less than MIN_AMOUNT or amount is not a number
+                    if amount < MIN_AMOUNT or math.isnan(amount):
+                        tx.status = "FAILED:AmountTooLow"
+                        print(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
+                        continue
+
                     # Extract wallet_id and btc_receiving_address from the _data parameter
                     data_param = decoded_input[1]['data'].decode('utf-8')
                     wallet_id, btc_receiving_address = data_param.split(':')[1].split('-')
@@ -305,12 +317,31 @@ async def process_unwrap_transactions():
                     # Update the database record with extracted information
                     tx.wallet_id = wallet_id
                     tx.btc_receiving_address = btc_receiving_address
-                    tx.amount = burnt_amount/100000000  # Convert from Wei to Ether
-                    tx.status = "CONFIRMED"
+                    tx.amount = amount
+                    tx.status = "CONFIRMING"
                 else:
                     logger.error(f"Unexpected function call: {func_signature}")
                     continue
 
+        except Exception as e:
+            print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            continue
+
+    session.commit()
+
+    confirming_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "CONFIRMING").all()
+
+    for tx in confirming_txs:
+        try:
+            eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
+            # Check the number of confirmations
+            block_number = eth_tx_receipt['blockNumber']
+            current_block = w3.eth.block_number
+            confirmations = current_block - block_number
+            if confirmations >= 6:
+                tx.status = "CONFIRMED"
+            else:
+                print(f"Transaction {tx.eth_tx_hash} not yet confirmed")
         except Exception as e:
             print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
             continue
