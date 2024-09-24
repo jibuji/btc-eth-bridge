@@ -1,16 +1,12 @@
 require("@nomiclabs/hardhat-waffle");
+require("dotenv").config();
 
 module.exports = {
   solidity: "0.8.20",
   networks: {
-    // hardhat: {
-    //   accounts: {
-    //     mnemonic: "test test test test test test test test test test test junk",
-    //   },
-    // },
-    // mainnet: {
-    //   url: "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID",
-    //   accounts: ["YOUR_PRIVATE_KEY"]
-    // }
+    sepolia: {
+      url: process.env.SEPOLIA_RPC_URL,
+      accounts: [process.env.PRIVATE_KEY]
+    }
   }
 };
