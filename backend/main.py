@@ -30,8 +30,12 @@ ETH_FEE_IN_WBTC = 100
 
 load_dotenv()
 
+# Modify the logging configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Set APScheduler logger to a higher level (WARNING or ERROR)
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
 
 # Create an AsyncIOScheduler
 scheduler = AsyncIOScheduler()
@@ -458,7 +462,7 @@ async def process_unwrap_transactions():
 
 # Add jobs to the scheduler
 scheduler.add_job(process_wrap_transactions, IntervalTrigger(minutes=2))
-scheduler.add_job(process_unwrap_transactions, IntervalTrigger(minutes=1))
+scheduler.add_job(process_unwrap_transactions, IntervalTrigger(minutes=2))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
