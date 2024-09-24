@@ -23,7 +23,7 @@ import re
 import time
 from bitcoinrpc.authproxy import JSONRPCException
 from enum import Enum
-from web3.exceptions import TransactionNotFound
+from web3.exceptions import TransactionNotFound,Web3ValueError
 from datetime import datetime, timedelta
 
 MIN_AMOUNT = 1000
@@ -403,15 +403,15 @@ async def process_unwrap_transactions():
             logger.warning(f"Transaction {tx.eth_tx_hash} not found. It may be pending or dropped.")
             
             tx.status = TransactionStatus.FAILED_TRANSACTION_NOT_FOUND
-            
             continue
-        except ValueError as e:
+
+        except Web3ValueError as e:
             error_message = str(e)
             if "insufficient funds" in error_message:
                 logger.error(f"Insufficient funds for transaction {tx.eth_tx_hash}: {error_message}")
                 tx.status = TransactionStatus.FAILED_INSUFFICIENT_FUNDS
             else:
-                logger.error(f"ValueError processing transaction {tx.eth_tx_hash}: {error_message}")
+                logger.error(f"Web3ValueError processing transaction {tx.eth_tx_hash}: {error_message}")
                 tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
             continue
         except Exception as e:
