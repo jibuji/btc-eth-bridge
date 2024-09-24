@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"strconv"
 	"time"
 
 	"context"
@@ -125,12 +126,16 @@ func updateHolders(client *ethclient.Client, db *sql.DB, wbtcAddress string) {
 	err = db.QueryRow("SELECT block_number FROM last_processed_block WHERE id = 1").Scan(&lastProcessedBlock)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// If no row exists, insert initial value
-			_, err = db.Exec("INSERT INTO last_processed_block (id, block_number) VALUES (1, 0)")
+			// If no row exists, insert initial value from environment
+			startingBlock, err := strconv.ParseUint(os.Getenv("STARTING_BLOCK"), 10, 64)
+			if err != nil {
+				log.Fatalf("Invalid STARTING_BLOCK in environment: %v", err)
+			}
+			_, err = db.Exec("INSERT INTO last_processed_block (id, block_number) VALUES (1, ?)", startingBlock)
 			if err != nil {
 				log.Fatalf("Failed to insert initial last processed block: %v", err)
 			}
-			lastProcessedBlock = 47
+			lastProcessedBlock = startingBlock
 		} else {
 			log.Fatalf("Failed to get last processed block: %v", err)
 		}
