@@ -158,7 +158,6 @@ class UnwrapTransaction(Base):
     amount = Column(Float, nullable=True)
     status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
     btc_tx_id = Column(String, nullable=True)
-    first_not_found_time = Column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -403,12 +402,7 @@ async def process_unwrap_transactions():
         except TransactionNotFound:
             logger.warning(f"Transaction {tx.eth_tx_hash} not found. It may be pending or dropped.")
             
-            # Check if the transaction has been in this state for too long
-            if not tx.first_not_found_time:
-                tx.first_not_found_time = datetime.utcnow()
-            elif datetime.utcnow() - tx.first_not_found_time > timedelta(hours=24):  # Adjust time as needed
-                logger.error(f"Transaction {tx.eth_tx_hash} has been missing for over 24 hours. Marking as failed.")
-                tx.status = TransactionStatus.FAILED_TRANSACTION_NOT_FOUND
+            tx.status = TransactionStatus.FAILED_TRANSACTION_NOT_FOUND
             
             continue
         except ValueError as e:
