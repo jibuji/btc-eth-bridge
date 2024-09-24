@@ -9,7 +9,7 @@ from web3 import Web3
 from bitcoinrpc.authproxy import AuthServiceProxy
 import os
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from contextlib import asynccontextmanager
 import json
@@ -23,6 +23,8 @@ import re
 import time
 from bitcoinrpc.authproxy import JSONRPCException
 from enum import Enum
+from web3.exceptions import TransactionNotFound
+from datetime import datetime, timedelta
 
 MIN_AMOUNT = 1000
 
@@ -133,6 +135,9 @@ class TransactionStatus(str, Enum):
 
     # Failure statuses
     FAILED_INSUFFICIENT_AMOUNT = "FAILED_INSUFFICIENT_AMOUNT"
+    FAILED_TRANSACTION_NOT_FOUND = "FAILED_TRANSACTION_NOT_FOUND"
+    FAILED_INSUFFICIENT_FUNDS = "FAILED_INSUFFICIENT_FUNDS"
+    FAILED_TRANSACTION_UNKNOWN = "FAILED_TRANSACTION_UNKNOWN"
 
 class WrapTransaction(Base):
     __tablename__ = "wrap_transactions"
@@ -153,6 +158,7 @@ class UnwrapTransaction(Base):
     amount = Column(Float, nullable=True)
     status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
     btc_tx_id = Column(String, nullable=True)
+    first_not_found_time = Column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -394,6 +400,26 @@ async def process_unwrap_transactions():
                     logger.error(f"Unexpected function call: {func_signature}")
                     continue
 
+        except TransactionNotFound:
+            logger.warning(f"Transaction {tx.eth_tx_hash} not found. It may be pending or dropped.")
+            
+            # Check if the transaction has been in this state for too long
+            if not tx.first_not_found_time:
+                tx.first_not_found_time = datetime.utcnow()
+            elif datetime.utcnow() - tx.first_not_found_time > timedelta(hours=24):  # Adjust time as needed
+                logger.error(f"Transaction {tx.eth_tx_hash} has been missing for over 24 hours. Marking as failed.")
+                tx.status = TransactionStatus.FAILED_TRANSACTION_NOT_FOUND
+            
+            continue
+        except ValueError as e:
+            error_message = str(e)
+            if "insufficient funds" in error_message:
+                logger.error(f"Insufficient funds for transaction {tx.eth_tx_hash}: {error_message}")
+                tx.status = TransactionStatus.FAILED_INSUFFICIENT_FUNDS
+            else:
+                logger.error(f"ValueError processing transaction {tx.eth_tx_hash}: {error_message}")
+                tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
+            continue
         except Exception as e:
             logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
             continue
