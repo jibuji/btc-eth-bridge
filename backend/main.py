@@ -306,16 +306,25 @@ async def process_wrap_transactions():
                         
                         # Deduct the ETH fee in WBTC
                         satoshis -= ETH_FEE_IN_WBTC * 100000000
-
+                        
                         # Mint WBTC
                         nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                         chain_id = w3.eth.chain_id  # Get the current chain ID
                         mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
                             'chainId': chain_id,
-                            'gas': 2000000,
                             'gasPrice': w3.eth.gas_price,
                             'nonce': nonce,
                         })
+                        # Estimate gas
+                        gas_estimate = w3.eth.estimate_gas({
+                            'to': mint_tx['to'],
+                            'data': mint_tx['data'],
+                            'from': os.getenv("OWNER_ADDRESS")
+                        })
+                        # Add a buffer to the estimated gas (e.g., 20%)
+                        gas_limit = int(gas_estimate * 1.2)
+                        mint_tx['gas'] = gas_limit
+                        logger.info(f"Mint transaction: {mint_tx}")
                         signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
                         eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
@@ -346,6 +355,16 @@ async def process_wrap_transactions():
                 time.sleep(retry_delay)
             else:
                 logger.error("Max retries reached. Please check your Bitcoin node connection.")
+        except Web3ValueError as e:
+            error_message = str(e)
+            if "insufficient funds" in error_message:
+                logger.error(f"Insufficient funds for transaction {tx.eth_tx_hash}: {error_message}")
+                tx.status = TransactionStatus.FAILED_INSUFFICIENT_FUNDS
+            else:
+                logger.error(f"Web3ValueError processing transaction {tx.eth_tx_hash}: {error_message}")
+                tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
+            continue
+
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
             break
