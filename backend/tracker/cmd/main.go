@@ -22,8 +22,7 @@ import (
 )
 
 const (
-	wbtcAddress = "0x610178dA211FEF7D417bC0e6FeD39F05609AD788" // WBTC contract address on Ethereum mainnet
-	batchSize   = 1000
+	batchSize = 1000
 )
 
 type Holder struct {
@@ -36,6 +35,12 @@ func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
+	}
+
+	// Read WBTC address from environment
+	wbtcAddress := os.Getenv("WBTC_ADDRESS")
+	if wbtcAddress == "" {
+		log.Fatalf("WBTC_ADDRESS not set in environment")
 	}
 
 	// Connect to Ethereum node (replace with your Infura URL or local node)
@@ -74,7 +79,7 @@ func main() {
 	}
 
 	// Start updating holders in a separate goroutine
-	go updateHolders(client, db)
+	go updateHolders(client, db, wbtcAddress)
 
 	// Fetch and display holders
 	fetchAndDisplayHolders(db)
@@ -94,7 +99,7 @@ func connectToDatabase() (*sql.DB, error) {
 	}
 }
 
-func updateHolders(client *ethclient.Client, db *sql.DB) {
+func updateHolders(client *ethclient.Client, db *sql.DB, wbtcAddress string) {
 	// Parse the contract ABI
 	contractABI, err := abi.JSON(strings.NewReader(`[
 		{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"},
