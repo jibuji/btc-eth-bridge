@@ -374,6 +374,7 @@ async def process_unwrap_transactions():
         try:
             eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
             if eth_tx_receipt:
+                logger.info(f"eth_tx_receipt of {tx.eth_tx_hash}: {eth_tx_receipt}")
                 if eth_tx_receipt['status'] == 1:
                     eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
                     calldata = eth_tx['input']
