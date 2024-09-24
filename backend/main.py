@@ -1,5 +1,7 @@
 from decimal import Decimal
 import logging
+from logging.handlers import RotatingFileHandler
+import sys
 import math
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -30,12 +32,36 @@ ETH_FEE_IN_WBTC = 100
 
 load_dotenv()
 
-# Modify the logging configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def setup_logging():
+    # Create a logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
 
-# Set APScheduler logger to a higher level (WARNING or ERROR)
-logging.getLogger('apscheduler').setLevel(logging.WARNING)
+    # Create handlers
+    file_handler = RotatingFileHandler('app.log', maxBytes=10*1024*1024, backupCount=5)
+    console_handler = logging.StreamHandler(sys.stdout)
+
+    # Set levels
+    file_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.WARNING)
+
+    # Create formatters and add it to handlers
+    log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(log_format)
+    console_handler.setFormatter(log_format)
+
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    # Set APScheduler logger to WARNING
+    logging.getLogger('apscheduler').setLevel(logging.WARNING)
+
+# Call this function at the start of your main.py
+setup_logging()
+
+# Use this logger throughout your application
+logger = logging.getLogger(__name__)
 
 # Create an AsyncIOScheduler
 scheduler = AsyncIOScheduler()
@@ -76,7 +102,7 @@ rpc_connection = AuthServiceProxy(btc_node_url)
 try:
     rpc_connection.loadwallet(btc_wallet_name)
 except Exception as e:
-    print(f"Failed to load wallet: {e}")
+    logger.error(f"Failed to load wallet: {e}")
 
 # Instead of creating a new AuthServiceProxy, update the existing one
 btc_node_wallet_url = f"{btc_node_url}/wallet/{btc_wallet_name}"
@@ -139,24 +165,24 @@ class UnwrapRequest(BaseModel):
 @app.post("/initiate-wrap/")
 async def initiate_wrap(wrap_request: WrapRequest):
     try:
-        print("received signed btc tx:", wrap_request.signed_btc_tx)
+        logger.info(f"received signed btc tx: {wrap_request.signed_btc_tx}")
         rpc_connection = AuthServiceProxy(btc_node_wallet_url)
         # Decode and extract information from the signed Bitcoin transaction
         decoded_tx = rpc_connection.decoderawtransaction(wrap_request.signed_btc_tx)
-        print("decoded tx:", decoded_tx)
+        logger.info(f"decoded tx: {decoded_tx}")
         op_return_data = next(output['scriptPubKey']['asm'] for output in decoded_tx['vout'] if output['scriptPubKey']['type'] == 'nulldata')
-        print("op return data:", op_return_data)
+        logger.info(f"op return data: {op_return_data}")
         # remove the 'OP_RETURN ' prefix
         op_return_data = op_return_data.replace('OP_RETURN ', '')
         # reverse binascii.hexlify
         op_return_data = binascii.unhexlify(op_return_data).decode()
-        print("op return data:", op_return_data)
+        logger.info(f"op return data: {op_return_data}")
         wallet_id, receiving_address = op_return_data.split(':')[1].split('-')
-        print("wallet id:", wallet_id)
-        print("receiving address:", receiving_address)
+        logger.info(f"wallet id: {wallet_id}")
+        logger.info(f"receiving address: {receiving_address}")
         amount = sum(output['value'] for output in decoded_tx['vout'] 
                      if output['scriptPubKey'].get('address') == bridge_btc_address)
-        print(f"Amount sent to bridge address: {amount} BTC")
+        logger.info(f"Amount sent to bridge address: {amount} BTC")
         if amount < MIN_AMOUNT:
             raise Exception(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC")
         
@@ -291,7 +317,7 @@ async def process_wrap_transactions():
                         tx.status = TransactionStatus.WBTC_MINTING_IN_PROGRESS
                         tx.eth_tx_hash = eth_tx_hash.hex()
                 except JSONRPCException as e:
-                    print(f"JSONRPC error for transaction {tx.btc_tx_id}: {e}")
+                    logger.error(f"JSONRPC error for transaction {tx.btc_tx_id}: {e}")
                     continue
 
             session.commit()
@@ -309,14 +335,14 @@ async def process_wrap_transactions():
             break  # If we get here, the function completed successfully
 
         except (BrokenPipeError, ConnectionError) as e:
-            print(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
+            logger.error(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
-                print(f"Retrying in {retry_delay} seconds...")
+                logger.info(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
             else:
-                print("Max retries reached. Please check your Bitcoin node connection.")
+                logger.error("Max retries reached. Please check your Bitcoin node connection.")
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            logger.error(f"Unexpected error: {e}")
             break
         finally:
             if 'session' in locals():
@@ -333,26 +359,26 @@ async def process_unwrap_transactions():
             if eth_tx_receipt and eth_tx_receipt['status'] == 1:
                 eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
                 calldata = eth_tx['input']
-                print("calldata:", calldata)
+                logger.info(f"calldata: {calldata}")
                 
                 # Get the function signature (first 4 bytes of the calldata)
                 func_signature = calldata[:4]
                 burn_signature = w3.keccak(text="burn(uint256,bytes)")[:4]
-                print(f"Extracted function signature: {func_signature}")
-                print(f"Expected burn function signature: {burn_signature}")
+                logger.info(f"Extracted function signature: {func_signature}")
+                logger.info(f"Expected burn function signature: {burn_signature}")
                 
                 if func_signature == burn_signature:
                     # Decode the burn function parameters
                     decoded_input = compiled_sol.decode_function_input(calldata)
-                    print("decoded_input:", decoded_input)
-                    print("decoded_input[1]:", decoded_input[1])
+                    logger.info(f"decoded_input: {decoded_input}")
+                    logger.info(f"decoded_input[1]: {decoded_input[1]}")
                     burnt_amount = decoded_input[1]['amount']
-                    print("burnt_amount:", burnt_amount)
+                    logger.info(f"burnt_amount: {burnt_amount}")
                     amount = burnt_amount/100000000
                     # check if amount is less than MIN_AMOUNT or amount is not a number
                     if amount < MIN_AMOUNT or math.isnan(amount):
                         tx.status = TransactionStatus.FAILED_INSUFFICIENT_AMOUNT
-                        print(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
+                        logger.error(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
                         continue
 
                     # Extract wallet_id and btc_receiving_address from the _data parameter
@@ -369,7 +395,7 @@ async def process_unwrap_transactions():
                     continue
 
         except Exception as e:
-            print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
             continue
 
     session.commit()
@@ -386,9 +412,9 @@ async def process_unwrap_transactions():
             if confirmations >= 6:
                 tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMED
             else:
-                print(f"Transaction {tx.eth_tx_hash} not yet confirmed")
+                logger.info(f"Transaction {tx.eth_tx_hash} not yet confirmed")
         except Exception as e:
-            print(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
             continue
 
     session.commit()
@@ -427,7 +453,7 @@ async def process_unwrap_transactions():
                 bridge_address: float(total_amount - total_needed)  # Change
             }
 
-            print("tx_outputs:", tx_outputs)
+            logger.info(f"tx_outputs: {tx_outputs}")
             # Format OP_RETURN data as hexadecimal
             op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTC_RECEIVE_ADDRESS')}"
             op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
@@ -443,7 +469,7 @@ async def process_unwrap_transactions():
             tx.btc_tx_id = btc_tx_id
 
         except Exception as e:
-            print(f"Error creating Bitcoin transaction for {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error creating Bitcoin transaction for {tx.eth_tx_hash}: {e}")
 
     session.commit()
 
@@ -455,7 +481,7 @@ async def process_unwrap_transactions():
             if btc_tx['confirmations'] >= 6:
                 tx.status = TransactionStatus.UNWRAP_COMPLETED
         except Exception as e:
-            print(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
+            logger.error(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
 
     session.commit()
     session.close()
