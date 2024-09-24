@@ -20,4 +20,9 @@ contract WBTC is ERC20, Ownable {
         // Emit an event with the attached data
         emit TokensBurned(msg.sender, amount, data);
     }
+
+    // Override the decimals function to set the token unit
+    function decimals() public view virtual override returns (uint8) {
+        return 8; // Set to 8 decimals, for example
+    }
 }

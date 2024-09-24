@@ -31,6 +31,7 @@ MIN_AMOUNT = 1000
 # Add these constants near the top of the file
 BTC_FEE = Decimal('0.01')
 ETH_FEE_IN_WBTC = 100
+TokenUnit = 100000000
 
 load_dotenv()
 
@@ -302,8 +303,7 @@ async def process_wrap_transactions():
                     btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
                     if btc_tx['confirmations'] >= 6:
                         # Convert BTC amount to satoshis, then to Wei
-                        satoshis = int(tx.amount * 100000000)  # 1 BTC = 100,000,000 satoshis
-                        
+                        satoshis = int(tx.amount * TokenUnit)  # 1 BTC = 100,000,000 satoshis
                         # Deduct the ETH fee in WBTC
                         satoshis -= ETH_FEE_IN_WBTC * 100000000
                         
@@ -373,42 +373,47 @@ async def process_unwrap_transactions():
     for tx in initiated_txs:
         try:
             eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
-            if eth_tx_receipt and eth_tx_receipt['status'] == 1:
-                eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
-                calldata = eth_tx['input']
-                logger.info(f"calldata: {calldata}")
-                
-                # Get the function signature (first 4 bytes of the calldata)
-                func_signature = calldata[:4]
-                burn_signature = w3.keccak(text="burn(uint256,bytes)")[:4]
-                logger.info(f"Extracted function signature: {func_signature}")
-                logger.info(f"Expected burn function signature: {burn_signature}")
-                
-                if func_signature == burn_signature:
-                    # Decode the burn function parameters
-                    decoded_input = compiled_sol.decode_function_input(calldata)
-                    logger.info(f"decoded_input: {decoded_input}")
-                    logger.info(f"decoded_input[1]: {decoded_input[1]}")
-                    burnt_amount = decoded_input[1]['amount']
-                    logger.info(f"burnt_amount: {burnt_amount}")
-                    amount = burnt_amount/100000000
-                    # check if amount is less than MIN_AMOUNT or amount is not a number
-                    if amount < MIN_AMOUNT or math.isnan(amount):
-                        tx.status = TransactionStatus.FAILED_INSUFFICIENT_AMOUNT
-                        logger.error(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
+            if eth_tx_receipt:
+                if eth_tx_receipt['status'] == 1:
+                    eth_tx = w3.eth.get_transaction(tx.eth_tx_hash)
+                    calldata = eth_tx['input']
+                    logger.info(f"calldata: {calldata}")
+                    
+                    # Get the function signature (first 4 bytes of the calldata)
+                    func_signature = calldata[:4]
+                    burn_signature = w3.keccak(text="burn(uint256,bytes)")[:4]
+                    logger.info(f"Extracted function signature: {func_signature}")
+                    logger.info(f"Expected burn function signature: {burn_signature}")
+                    
+                    if func_signature == burn_signature:
+                        # Decode the burn function parameters
+                        decoded_input = compiled_sol.decode_function_input(calldata)
+                        logger.info(f"decoded_input: {decoded_input}")
+                        logger.info(f"decoded_input[1]: {decoded_input[1]}")
+                        burnt_amount = decoded_input[1]['amount']
+                        logger.info(f"burnt_amount: {burnt_amount}")
+                        amount = burnt_amount / 100000000
+                        # check if amount is less than MIN_AMOUNT or amount is not a number
+                        if amount < MIN_AMOUNT or math.isnan(amount):
+                            tx.status = TransactionStatus.FAILED_INSUFFICIENT_AMOUNT
+                            logger.error(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
+                            continue
+
+                        # Extract wallet_id and btc_receiving_address from the _data parameter
+                        data_param = decoded_input[1]['data'].decode('utf-8')
+                        wallet_id, btc_receiving_address = data_param.split(':')[1].split('-')
+
+                        # Update the database record with extracted information
+                        tx.wallet_id = wallet_id
+                        tx.btc_receiving_address = btc_receiving_address
+                        tx.amount = amount
+                        tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMING
+                    else:
+                        logger.error(f"Unexpected function call: {func_signature}")
                         continue
-
-                    # Extract wallet_id and btc_receiving_address from the _data parameter
-                    data_param = decoded_input[1]['data'].decode('utf-8')
-                    wallet_id, btc_receiving_address = data_param.split(':')[1].split('-')
-
-                    # Update the database record with extracted information
-                    tx.wallet_id = wallet_id
-                    tx.btc_receiving_address = btc_receiving_address
-                    tx.amount = amount
-                    tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMING
-                else:
-                    logger.error(f"Unexpected function call: {func_signature}")
+                elif eth_tx_receipt['status'] == 0:
+                    tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
+                    logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
                     continue
 
         except TransactionNotFound:
