@@ -22,7 +22,11 @@ import time
 from bitcoinrpc.authproxy import JSONRPCException
 from enum import Enum
 
-MIN_AMOUNT = 100
+MIN_AMOUNT = 1000
+
+# Add these constants near the top of the file
+BTC_FEE = Decimal('0.01')
+ETH_FEE_IN_WBTC = 100
 
 load_dotenv()
 
@@ -230,6 +234,21 @@ async def unwrap_history(wallet_id: str):
 
     return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount} for tx in unwrap_txs]
 
+# Add these new endpoints
+@app.get("/wrap-fee")
+async def get_wrap_fee():
+    return {
+        "btc_fee": float(BTC_FEE),
+        "eth_fee_in_wbtc": ETH_FEE_IN_WBTC
+    }
+
+@app.get("/unwrap-fee")
+async def get_unwrap_fee():
+    return {
+        "btc_fee": float(BTC_FEE),
+        "eth_gas_price": w3.eth.gas_price
+    }
+
 # Background tasks (to be run periodically)
 
 
@@ -249,12 +268,14 @@ async def process_wrap_transactions():
                     if btc_tx['confirmations'] >= 6:
                         # Convert BTC amount to satoshis, then to Wei
                         satoshis = int(tx.amount * 100000000)  # 1 BTC = 100,000,000 satoshis
-                        wei_amount = Web3.to_wei(satoshis, 'wei')  # 1 WBTC = 1e8 wei (same as 1 satoshi)
+                        
+                        # Deduct the ETH fee in WBTC
+                        satoshis -= ETH_FEE_IN_WBTC * 100000000
 
                         # Mint WBTC
                         nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                         chain_id = w3.eth.chain_id  # Get the current chain ID
-                        mint_tx = compiled_sol.functions.mint(tx.receiving_address, wei_amount).build_transaction({
+                        mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
                             'chainId': chain_id,
                             'gas': 2000000,
                             'gasPrice': w3.eth.gas_price,
@@ -375,9 +396,8 @@ async def process_unwrap_transactions():
             # Fetch unspent transactions to use as inputs
                 
             bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
-            amount_to_send = Decimal(str(tx.amount))
-            fee = Decimal('0.0001')
-            total_needed = amount_to_send + fee
+            amount_to_send = Decimal(str(tx.amount)) - BTC_FEE
+            total_needed = amount_to_send + BTC_FEE
 
             # Fetch unspent UTXOs with minimum amount and sum
             unspent = rpc_connection.listunspent(0, 9999999, [bridge_address], False, {
