@@ -20,6 +20,7 @@ import binascii
 import re
 import time
 from bitcoinrpc.authproxy import JSONRPCException
+from enum import Enum
 
 MIN_AMOUNT = 100
 
@@ -80,6 +81,25 @@ engine = create_engine(os.getenv("DATABASE_URL"))
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 
+class TransactionStatus(str, Enum):
+    # Wrap statuses
+    WRAP_BTC_TRANSACTION_BROADCASTED = "WRAP_BTC_TRANSACTION_BROADCASTED"
+    WRAP_BTC_TRANSACTION_CONFIRMING = "WRAP_BTC_TRANSACTION_CONFIRMING"
+    WBTC_MINTING_IN_PROGRESS = "WBTC_MINTING_IN_PROGRESS"
+    WRAP_COMPLETED = "WRAP_COMPLETED"
+
+    # Unwrap statuses
+    UNWRAP_ETH_TRANSACTION_INITIATED = "UNWRAP_ETH_TRANSACTION_INITIATED"
+    UNWRAP_ETH_TRANSACTION_CONFIRMING = "UNWRAP_ETH_TRANSACTION_CONFIRMING"
+    UNWRAP_ETH_TRANSACTION_CONFIRMED = "UNWRAP_ETH_TRANSACTION_CONFIRMED"
+    WBTC_BURN_CONFIRMED = "WBTC_BURN_CONFIRMED"
+    UNWRAP_BTC_TRANSACTION_CREATING = "UNWRAP_BTC_TRANSACTION_CREATING"
+    UNWRAP_BTC_TRANSACTION_BROADCASTED = "UNWRAP_BTC_TRANSACTION_BROADCASTED"
+    UNWRAP_COMPLETED = "UNWRAP_COMPLETED"
+
+    # Failure statuses
+    FAILED_INSUFFICIENT_AMOUNT = "FAILED_INSUFFICIENT_AMOUNT"
+
 class WrapTransaction(Base):
     __tablename__ = "wrap_transactions"
     id = Column(Integer, primary_key=True, index=True)
@@ -87,7 +107,7 @@ class WrapTransaction(Base):
     wallet_id = Column(String, index=True)
     receiving_address = Column(String)
     amount = Column(Float)
-    status = Column(String)
+    status = Column(String, default=TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED)
     eth_tx_hash = Column(String)
 
 class UnwrapTransaction(Base):
@@ -97,7 +117,7 @@ class UnwrapTransaction(Base):
     wallet_id = Column(String, index=True, nullable=True)
     btc_receiving_address = Column(String, nullable=True)
     amount = Column(Float, nullable=True)
-    status = Column(String)
+    status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
     btc_tx_id = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
@@ -142,13 +162,13 @@ async def initiate_wrap(wrap_request: WrapRequest):
             wallet_id=wallet_id,
             receiving_address=receiving_address,
             amount=amount,
-            status="BROADCASTED"
+            status=TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED
         )
         session.add(new_wrap)
         session.commit()
         session.close()
 
-        return {"btc_tx_id": btc_tx_id, "status": "BROADCASTED"}
+        return {"btc_tx_id": btc_tx_id, "status": TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -162,13 +182,13 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
         session = Session()
         new_unwrap = UnwrapTransaction(
             eth_tx_hash=eth_tx_hash.hex(),
-            status="INITIATED"
+            status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED
         )
         session.add(new_unwrap)
         session.commit()
         session.close()
 
-        return {"eth_tx_hash": eth_tx_hash.hex(), "status": "INITIATED"}
+        return {"eth_tx_hash": eth_tx_hash.hex(), "status": TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -220,7 +240,7 @@ async def process_wrap_transactions():
     for attempt in range(max_retries):
         try:
             session = Session()
-            broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == "BROADCASTED").all()
+            broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED).all()
 
             for tx in broadcasted_txs:
                 # Check Bitcoin transaction confirmation
@@ -243,7 +263,7 @@ async def process_wrap_transactions():
                         signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
                         eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-                        tx.status = "MINTING"
+                        tx.status = TransactionStatus.WBTC_MINTING_IN_PROGRESS
                         tx.eth_tx_hash = eth_tx_hash.hex()
                 except JSONRPCException as e:
                     print(f"JSONRPC error for transaction {tx.btc_tx_id}: {e}")
@@ -251,13 +271,13 @@ async def process_wrap_transactions():
 
             session.commit()
 
-            minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == "MINTING").all()
+            minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WBTC_MINTING_IN_PROGRESS).all()
 
             for tx in minting_txs:
                 # Check WBTC minting transaction confirmation
                 eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
                 if eth_tx and eth_tx['status'] == 1:
-                    tx.status = "COMPLETED"
+                    tx.status = TransactionStatus.WRAP_COMPLETED
 
             session.commit()
             session.close()
@@ -279,7 +299,7 @@ async def process_wrap_transactions():
 
 async def process_unwrap_transactions():
     session = Session()
-    initiated_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "INITIATED").all()
+    initiated_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED).all()
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
     
     for tx in initiated_txs:
@@ -306,7 +326,7 @@ async def process_unwrap_transactions():
                     amount = burnt_amount/100000000
                     # check if amount is less than MIN_AMOUNT or amount is not a number
                     if amount < MIN_AMOUNT or math.isnan(amount):
-                        tx.status = "FAILED:AmountTooLow"
+                        tx.status = TransactionStatus.FAILED_INSUFFICIENT_AMOUNT
                         print(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
                         continue
 
@@ -318,7 +338,7 @@ async def process_unwrap_transactions():
                     tx.wallet_id = wallet_id
                     tx.btc_receiving_address = btc_receiving_address
                     tx.amount = amount
-                    tx.status = "CONFIRMING"
+                    tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMING
                 else:
                     logger.error(f"Unexpected function call: {func_signature}")
                     continue
@@ -329,7 +349,7 @@ async def process_unwrap_transactions():
 
     session.commit()
 
-    confirming_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "CONFIRMING").all()
+    confirming_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMING).all()
 
     for tx in confirming_txs:
         try:
@@ -339,7 +359,7 @@ async def process_unwrap_transactions():
             current_block = w3.eth.block_number
             confirmations = current_block - block_number
             if confirmations >= 6:
-                tx.status = "CONFIRMED"
+                tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMED
             else:
                 print(f"Transaction {tx.eth_tx_hash} not yet confirmed")
         except Exception as e:
@@ -348,11 +368,10 @@ async def process_unwrap_transactions():
 
     session.commit()
 
-    confirmed_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "CONFIRMED").all()
+    confirmed_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMED).all()
 
     for tx in confirmed_txs:
         try:
-            data = binascii.hexlify(f"wrp:{tx.wallet_id}-{tx.eth_tx_hash}".encode()).decode()
             # Fetch unspent transactions to use as inputs
                 
             bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
@@ -396,7 +415,7 @@ async def process_unwrap_transactions():
             signed_tx = rpc_connection.signrawtransactionwithwallet(btc_tx)
             btc_tx_id = rpc_connection.sendrawtransaction(signed_tx['hex'])
 
-            tx.status = "BROADCASTED"
+            tx.status = TransactionStatus.UNWRAP_BTC_TRANSACTION_BROADCASTED
             tx.btc_tx_id = btc_tx_id
 
         except Exception as e:
@@ -404,13 +423,13 @@ async def process_unwrap_transactions():
 
     session.commit()
 
-    broadcasted_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == "BROADCASTED").all()
+    broadcasted_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_BTC_TRANSACTION_BROADCASTED).all()
 
     for tx in broadcasted_txs:
         try:
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
             if btc_tx['confirmations'] >= 6:
-                tx.status = "COMPLETED"
+                tx.status = TransactionStatus.UNWRAP_COMPLETED
         except Exception as e:
             print(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
 
