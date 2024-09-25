@@ -289,81 +289,61 @@ async def get_unwrap_fee():
 
 
 async def process_wrap_transactions():
-    max_retries = 3
-    retry_delay = 5  # seconds
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
-    for attempt in range(max_retries):
+
+    session = Session()
+    broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED).all()
+
+    for tx in broadcasted_txs:
+        # Check Bitcoin transaction confirmation
         try:
-            session = Session()
-            broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED).all()
+            btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
+            if btc_tx['confirmations'] >= 6:
+                # Convert BTC amount to satoshis, then to Wei
+                satoshis = int(tx.amount * TokenUnit)  # 1 BTC = 100,000,000 satoshis
+                # Deduct the ETH fee in WBTC
+                satoshis -= ETH_FEE_IN_WBTC * TokenUnit
+                
+                # Mint WBTC
+                nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
+                chain_id = w3.eth.chain_id  # Get the current chain ID
+                mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
+                    'chainId': chain_id,
+                    'gasPrice': w3.eth.gas_price,
+                    'nonce': nonce,
+                    'gas': 2000000
+                })
+                
+                logger.info(f"Mint transaction: {mint_tx}")
+                signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
+                eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            for tx in broadcasted_txs:
-                # Check Bitcoin transaction confirmation
-                try:
-                    btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-                    if btc_tx['confirmations'] >= 6:
-                        # Convert BTC amount to satoshis, then to Wei
-                        satoshis = int(tx.amount * TokenUnit)  # 1 BTC = 100,000,000 satoshis
-                        # Deduct the ETH fee in WBTC
-                        satoshis -= ETH_FEE_IN_WBTC * 100000000
-                        
-                        # Mint WBTC
-                        nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
-                        chain_id = w3.eth.chain_id  # Get the current chain ID
-                        mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
-                            'chainId': chain_id,
-                            'gasPrice': w3.eth.gas_price,
-                            'nonce': nonce,
-                            'gas': 2000000
-                        })
-                        
-                        logger.info(f"Mint transaction: {mint_tx}")
-                        signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
-                        eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-
-                        tx.status = TransactionStatus.WBTC_MINTING_IN_PROGRESS
-                        tx.eth_tx_hash = eth_tx_hash.hex()
-                except JSONRPCException as e:
-                    logger.error(f"process_wrap_transactions JSONRPC error for transaction {tx.btc_tx_id}: {e}")
-                    continue
-
-            session.commit()
-
-            minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WBTC_MINTING_IN_PROGRESS).all()
-
-            for tx in minting_txs:
-                # Check WBTC minting transaction confirmation
-                eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
-                if eth_tx and eth_tx['status'] == 1:
-                    tx.status = TransactionStatus.WRAP_COMPLETED
-
-            session.commit()
-            session.close()
-            break  # If we get here, the function completed successfully
-
-        except (BrokenPipeError, ConnectionError) as e:
-            logger.error(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                logger.error("Max retries reached. Please check your Bitcoin node connection.")
-        except Web3ValueError as e:
-            error_message = str(e)
-            if "insufficient funds" in error_message:
-                logger.error(f"process_wrap_transactions Insufficient funds for transaction {tx.eth_tx_hash}: {error_message}")
-                tx.status = TransactionStatus.FAILED_INSUFFICIENT_FUNDS
-            else:
-                logger.error(f"process_wrap_transactions Web3ValueError processing transaction {tx.eth_tx_hash}: {error_message}")
-                tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
+                tx.status = TransactionStatus.WBTC_MINTING_IN_PROGRESS
+                tx.eth_tx_hash = eth_tx_hash.hex()
+        except JSONRPCException as e:
+            logger.error(f"process_wrap_transactions JSONRPC error for transaction {tx.btc_tx_id}: {e}")
             continue
 
+    session.commit()
+
+    minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WBTC_MINTING_IN_PROGRESS).all()
+
+    for tx in minting_txs:
+        try:
+            # Check WBTC minting transaction confirmation
+            eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
+            if eth_tx and eth_tx['status'] == 1:
+                tx.status = TransactionStatus.WRAP_COMPLETED
+            else:
+                logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
+                tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
         except Exception as e:
-            logger.error(f"process_wrap_transactions Unexpected error: {e}")
-            break
-        finally:
-            if 'session' in locals():
-                session.close()
+            logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            continue
+
+    session.commit()
+    session.close()
+
 
 async def process_unwrap_transactions():
     session = Session()
@@ -417,21 +397,6 @@ async def process_unwrap_transactions():
                     logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
                     continue
 
-        except TransactionNotFound:
-            logger.warning(f"Transaction {tx.eth_tx_hash} not found. It may be pending or dropped.")
-            
-            tx.status = TransactionStatus.FAILED_TRANSACTION_NOT_FOUND
-            continue
-
-        except Web3ValueError as e:
-            error_message = str(e)
-            if "insufficient funds" in error_message:
-                logger.error(f"Insufficient funds for transaction {tx.eth_tx_hash}: {error_message}")
-                tx.status = TransactionStatus.FAILED_INSUFFICIENT_FUNDS
-            else:
-                logger.error(f"Web3ValueError processing transaction {tx.eth_tx_hash}: {error_message}")
-                tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
-            continue
         except Exception as e:
             logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
             continue
