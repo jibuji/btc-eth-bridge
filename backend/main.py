@@ -25,6 +25,12 @@ from bitcoinrpc.authproxy import JSONRPCException
 from enum import Enum
 from web3.exceptions import TransactionNotFound,Web3ValueError
 from datetime import datetime, timedelta
+import rlp
+from eth_utils import decode_hex
+from eth_abi.codec import ABICodec
+from eth_abi.registry import registry
+from web3.types import TxData
+from web3._utils.transactions import Transaction
 
 MIN_AMOUNT = 1000
 
@@ -218,17 +224,53 @@ async def initiate_wrap(wrap_request: WrapRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+# Create an instance of ABICodec
+abi_codec = ABICodec(registry)
+
 @app.post("/initiate-unwrap/")
 async def initiate_unwrap(unwrap_request: UnwrapRequest):
     try:
-        # Broadcast the transaction without decoding
+        # Decode the raw transaction using rlp
+        decoded_tx = rlp.decode(decode_hex(unwrap_request.signed_eth_tx), Transaction)
+
+        # Get the input data
+        input_data = decoded_tx.data
+        
+        # The first 4 bytes are the function selector
+        function_selector = input_data[:4]
+        
+        # The rest is the encoded arguments
+        encoded_args = input_data[4:]
+        
+        # Check if it's the burn function
+        burn_selector = Web3.keccak(text="burn(uint256,bytes)")[:4].hex()
+        
+        if function_selector.hex() == burn_selector:
+            # Decode the arguments
+            decoded_args = abi_codec.decode(['uint256', 'bytes'], encoded_args)
+            amount, data = decoded_args
+            
+            # Convert amount from satoshis to BTC
+            amount_btc = amount / 1e8
+            
+            # Decode the data (assuming it's UTF-8 encoded)
+            decoded_data = data.decode('utf-8')
+            
+            logger.info(f"Burn amount: {amount_btc} BTC")
+            logger.info(f"Burn data: {decoded_data}")
+        else:
+            logger.warning("Transaction is not a burn function call")
+
+        # Broadcast the transaction
         eth_tx_hash = w3.eth.send_raw_transaction(unwrap_request.signed_eth_tx)
 
-        # Create a database record with minimal information
+        # Create a database record
         session = Session()
         new_unwrap = UnwrapTransaction(
             eth_tx_hash=eth_tx_hash.hex(),
-            status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED
+            status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED,
+            amount=amount_btc,  # Store the decoded amount
+            # You might want to parse and store other information from decoded_data
         )
         session.add(new_unwrap)
         session.commit()
@@ -236,6 +278,7 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
 
         return {"eth_tx_hash": eth_tx_hash.hex(), "status": TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED}
     except Exception as e:
+        logger.error(f"Error in initiate_unwrap: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/wrap-status/{btc_tx_id}")

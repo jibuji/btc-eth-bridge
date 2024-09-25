@@ -109,7 +109,7 @@ def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_addres
         transaction = burn_function.build_transaction({
             'chainId': chain_id,
             'gas': 2000000,
-            'gasPrice': int(w3.eth.gas_price/20),
+            'gasPrice': int(w3.eth.gas_price/10),
             'nonce': nonce,
         })
         
