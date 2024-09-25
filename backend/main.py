@@ -9,7 +9,7 @@ from web3 import Web3
 from bitcoinrpc.authproxy import AuthServiceProxy
 import os
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from contextlib import asynccontextmanager
 import json
@@ -149,6 +149,9 @@ class WrapTransaction(Base):
     amount = Column(Float)
     status = Column(String, default=TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED)
     eth_tx_hash = Column(String)
+    # New columns
+    exception_details = Column(Text, default='{}')
+    exception_count = Column(Integer, default=0)
 
 class UnwrapTransaction(Base):
     __tablename__ = "unwrap_transactions"
@@ -159,6 +162,9 @@ class UnwrapTransaction(Base):
     amount = Column(Float, nullable=True)
     status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
     btc_tx_id = Column(String, nullable=True)
+    # New columns
+    exception_details = Column(Text, default='{}')
+    exception_count = Column(Integer, default=0)
 
 Base.metadata.create_all(bind=engine)
 
@@ -287,6 +293,24 @@ async def get_unwrap_fee():
 
 # Background tasks (to be run periodically)
 
+def update_exception_details(tx, exception):
+    """
+    Update exception details and count for a transaction.
+    
+    :param tx: The transaction object (WrapTransaction or UnwrapTransaction)
+    :param exception: The exception that occurred
+    """
+    exception_str = str(exception)
+    
+    # Load existing exception details
+    exception_details = json.loads(tx.exception_details or '{}')
+    
+    # Update the count
+    exception_details[exception_str] = exception_details.get(exception_str, 0) + 1
+    
+    # Save updated exception details
+    tx.exception_details = json.dumps(exception_details)
+    tx.exception_count = sum(exception_details.values())
 
 async def process_wrap_transactions():
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
@@ -295,8 +319,8 @@ async def process_wrap_transactions():
     broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED).all()
 
     for tx in broadcasted_txs:
-        # Check Bitcoin transaction confirmation
         try:
+            # Check Bitcoin transaction confirmation
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
             if btc_tx['confirmations'] >= 6:
                 # Convert BTC amount to satoshis, then to Wei
@@ -322,6 +346,7 @@ async def process_wrap_transactions():
                 tx.eth_tx_hash = eth_tx_hash.hex()
         except JSONRPCException as e:
             logger.error(f"process_wrap_transactions JSONRPC error for transaction {tx.btc_tx_id}: {e}")
+            update_exception_details(tx, e)
             continue
 
     session.commit()
@@ -338,7 +363,8 @@ async def process_wrap_transactions():
                 logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
                 tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
         except Exception as e:
-            logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
+            update_exception_details(tx, e)
             continue
 
     session.commit()
@@ -398,7 +424,8 @@ async def process_unwrap_transactions():
                     continue
 
         except Exception as e:
-            logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
+            update_exception_details(tx, e)
             continue
 
     session.commit()
@@ -417,7 +444,8 @@ async def process_unwrap_transactions():
             else:
                 logger.info(f"Transaction {tx.eth_tx_hash} not yet confirmed")
         except Exception as e:
-            logger.error(f"Error processing transaction {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
+            update_exception_details(tx, e)
             continue
 
     session.commit()
@@ -473,6 +501,7 @@ async def process_unwrap_transactions():
 
         except Exception as e:
             logger.error(f"Error creating Bitcoin transaction for {tx.eth_tx_hash}: {e}")
+            update_exception_details(tx, e)
 
     session.commit()
 
@@ -485,6 +514,7 @@ async def process_unwrap_transactions():
                 tx.status = TransactionStatus.UNWRAP_COMPLETED
         except Exception as e:
             logger.error(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
+            update_exception_details(tx, e)
 
     session.commit()
     session.close()

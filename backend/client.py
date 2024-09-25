@@ -97,20 +97,19 @@ def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_addres
         chain_id = w3.eth.chain_id
 
         satoshis = int(wbtc_amount * 100000000)  # 1 BTC = 100,000,000 satoshis
-        amount_in_wei = Web3.to_wei(satoshis, 'wei')  # 1 WBTC = 1e8 wei (same as 1 satoshi)
 
-        print("amount_in_wei:", amount_in_wei)
+        print("satoshis:", satoshis)
         # Prepare the custom data
         custom_data = f"wrp:{wallet_id}-{btc_receiving_address}".encode('utf-8')
         print("custom_data:", custom_data)
         # Prepare the burn function call with both arguments
-        burn_function = wbtc_contract.functions.burn(amount_in_wei, custom_data)
-        
+        burn_function = wbtc_contract.functions.burn(satoshis, custom_data)
+        print("gas_price:", w3.eth.gas_price)
         # Prepare transaction data
         transaction = burn_function.build_transaction({
             'chainId': chain_id,
             'gas': 2000000,
-            'gasPrice': w3.eth.gas_price,
+            'gasPrice': int(w3.eth.gas_price/20),
             'nonce': nonce,
         })
         

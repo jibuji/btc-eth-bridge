@@ -128,8 +128,8 @@ BTC transaction fee is included in the BTC transaction constructed in backend.
 
 
 ```bash
-python client.py wrap --amount 0.1 --wallet-id your_wallet_id
-python client.py unwrap --amount 0.1 --wallet-id your_wallet_id
+python client.py wrap --amount 1001.1 --wallet-id your_wallet_id
+python client.py unwrap --amount 1001.1 --wallet-id your_wallet_id
 python client.py wrap-status --tx-id your_btc_tx_id
 python client.py unwrap-status --tx-id your_eth_tx_hash
 python client.py wrap-history --wallet-id your_wallet_id
