@@ -37,7 +37,7 @@ MIN_AMOUNT = 1000
 BTC_FEE = Decimal('0.01')
 ETH_FEE_IN_WBTC = 100
 TokenUnit = 100000000
-MaxGasPrice = 100*10**9 # 100 Gwei
+MaxGasPrice = 400*10**9 # 200 Gwei
 MAX_ATTEMPTS = 20
 
 load_dotenv()
@@ -457,13 +457,13 @@ async def process_wrap_transactions():
 
                 logger.info(f"mintinggas_price: {gas_price}")
 
-                nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
+                nonce = int((datetime.utcnow() - datetime(2024, 9, 26)).total_seconds())
                 chain_id = w3.eth.chain_id  # Get the current chain ID
                 mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
                     'chainId': chain_id,
                     'gasPrice': int(gas_price),
                     'nonce': nonce,
-                    'gas': 2000000
+                    'gas': 100000
                 })
                 
                 logger.info(f"Mint transaction: {mint_tx}")
@@ -485,6 +485,8 @@ async def process_wrap_transactions():
     minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WBTC_MINTING_IN_PROGRESS).all()
 
     for tx in minting_txs:
+        if not should_process_transaction(tx):
+            continue
         try:
             # Check WBTC minting transaction confirmation
             eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)

@@ -89,7 +89,7 @@ def create_and_send_btc_transaction(recipient_address, amount_btc, wallet_id):
         print(f"An error occurred: {e}")
         return None
 
-MaxGasPrice = 60*10**9 # 100 Gwei
+MaxGasPrice = 70*10**9 # 100 Gwei
 def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_address):
     try:
         nonce = w3.eth.get_transaction_count(os.getenv("ETH_SENDER_ADDRESS"))
