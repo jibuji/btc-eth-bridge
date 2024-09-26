@@ -43,6 +43,9 @@ MAX_ATTEMPTS = 20
 # Add this constant near the top of the file
 CONFIRMATIONS_REQUIRED = 1
 
+# Add this constant near the top of the file, with the other constants
+DUST_THRESHOLD = Decimal('0.00000546')
+
 load_dotenv()
 
 def setup_logging():
@@ -611,7 +614,7 @@ async def process_unwrap_transactions():
 
             # Fetch unspent UTXOs with minimum amount and sum
             unspent = rpc_connection.listunspent(0, 9999999, [bridge_address], False, {
-                "minimumAmount": "0.00000546",
+                "minimumAmount": float(DUST_THRESHOLD),
                 "minimumSumAmount": float(total_needed)
             })
             
@@ -630,8 +633,12 @@ async def process_unwrap_transactions():
             tx_inputs = [{"txid": input['txid'], "vout": input['vout']} for input in unspent]
             tx_outputs = {
                 tx.btc_receiving_address: float(amount_to_send),
-                bridge_address: float(total_amount - total_needed)  # Change
             }
+
+            # Calculate change and add it if it's not dust
+            change = total_amount - total_needed
+            if change > DUST_THRESHOLD:  # Minimum non-dust output
+                tx_outputs[bridge_address] = float(change)
 
             logger.info(f"tx_outputs: {tx_outputs}")
             # Format OP_RETURN data as hexadecimal
