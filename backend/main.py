@@ -40,6 +40,9 @@ TokenUnit = 100000000
 MaxGasPrice = 400*10**9 # 200 Gwei
 MAX_ATTEMPTS = 20
 
+# Add this constant near the top of the file
+CONFIRMATIONS_REQUIRED = 1
+
 load_dotenv()
 
 def setup_logging():
@@ -156,7 +159,7 @@ class WrapTransaction(Base):
     amount = Column(Float)
     status = Column(String, default=TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED)
     eth_tx_hash = Column(String)
-    # New columns
+    
     exception_details = Column(Text, default='{}')
     exception_count = Column(Integer, default=0)
     last_exception_time = Column(DateTime, nullable=True)
@@ -444,7 +447,7 @@ async def process_wrap_transactions():
         try:
             # Check Bitcoin transaction confirmation
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-            if btc_tx['confirmations'] >= 6:
+            if btc_tx['confirmations'] >= CONFIRMATIONS_REQUIRED:
                 # Convert BTC amount to satoshis, then to Wei
                 satoshis = int(tx.amount * TokenUnit)  # 1 BTC = 100,000,000 satoshis
                 # Deduct the ETH fee in WBTC
@@ -457,7 +460,7 @@ async def process_wrap_transactions():
 
                 logger.info(f"mintinggas_price: {gas_price}")
 
-                nonce = int((datetime.utcnow() - datetime(2024, 9, 26)).total_seconds())
+                nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                 chain_id = w3.eth.chain_id  # Get the current chain ID
                 mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
                     'chainId': chain_id,
@@ -581,7 +584,7 @@ async def process_unwrap_transactions():
             block_number = eth_tx_receipt['blockNumber']
             current_block = w3.eth.block_number
             confirmations = current_block - block_number
-            if confirmations >= 6:
+            if confirmations >= CONFIRMATIONS_REQUIRED:
                 tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMED
             else:
                 logger.info(f"Transaction {tx.eth_tx_hash} not yet confirmed")
@@ -662,7 +665,7 @@ async def process_unwrap_transactions():
         
         try:
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-            if btc_tx['confirmations'] >= 6:
+            if btc_tx['confirmations'] >= CONFIRMATIONS_REQUIRED:
                 tx.status = TransactionStatus.UNWRAP_COMPLETED
             # If successful, reset exception details
             reset_exception_details(tx)
