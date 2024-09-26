@@ -16,7 +16,11 @@ async function main() {
     console.log("Deploying contracts with the account:", wallet.address);
 
     const WBTC = await ethers.getContractFactory("WBTC");
-    const wbtc = await WBTC.deploy(wallet.address);
+    
+    // Set the gas price (in wei)
+    const gasPrice = ethers.utils.parseUnits('20', 'gwei'); // Adjust this value as needed
+    
+    const wbtc = await WBTC.deploy(wallet.address, { gasPrice: gasPrice });
     await wbtc.deployed();
 
     console.log("WBTC deployed to:", wbtc.address);

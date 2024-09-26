@@ -3,6 +3,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import sys
 import math
+from typing import List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from web3 import Web3
@@ -26,6 +27,8 @@ from eth_abi.registry import registry
 from eth.vm.forks.arrow_glacier.transactions import ArrowGlacierTransactionBuilder as TransactionBuilder
 from eth_utils import to_bytes, encode_hex
 from web3.auto import w3
+from datetime import datetime, timedelta
+import time
 
 
 MIN_AMOUNT = 1000
@@ -35,6 +38,8 @@ BTC_FEE = Decimal('0.01')
 ETH_FEE_IN_WBTC = 100
 TokenUnit = 100000000
 MaxGasPrice = 100*10**9 # 100 Gwei
+MAX_ATTEMPTS = 20
+
 load_dotenv()
 
 def setup_logging():
@@ -141,7 +146,7 @@ class TransactionStatus(str, Enum):
     FAILED_TRANSACTION_NOT_FOUND = "FAILED_TRANSACTION_NOT_FOUND"
     FAILED_INSUFFICIENT_FUNDS = "FAILED_INSUFFICIENT_FUNDS"
     FAILED_TRANSACTION_UNKNOWN = "FAILED_TRANSACTION_UNKNOWN"
-
+    FAILED_TRANSACTION_MAX_ATTEMPTS = "FAILED_TRANSACTION_MAX_ATTEMPTS"
 class WrapTransaction(Base):
     __tablename__ = "wrap_transactions"
     id = Column(Integer, primary_key=True, index=True)
@@ -154,6 +159,8 @@ class WrapTransaction(Base):
     # New columns
     exception_details = Column(Text, default='{}')
     exception_count = Column(Integer, default=0)
+    last_exception_time = Column(DateTime, nullable=True)
+    create_time = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 class UnwrapTransaction(Base):
     __tablename__ = "unwrap_transactions"
@@ -167,6 +174,8 @@ class UnwrapTransaction(Base):
     # New columns
     exception_details = Column(Text, default='{}')
     exception_count = Column(Integer, default=0)
+    last_exception_time = Column(DateTime, nullable=True)
+    create_time = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 Base.metadata.create_all(bind=engine)
 
@@ -275,12 +284,25 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
             wallet_id, btc_receiving_address = decoded_data.split(':')[1].split('-')
 
             # Broadcast the transaction
-            eth_tx_hash = w3.eth.send_raw_transaction(signed_tx_as_bytes)
-
+            eth_tx_hash = None
+            try:
+                eth_tx_hash = w3.eth.send_raw_transaction(signed_tx_as_bytes)
+                eth_tx_hash = w3.to_hex(eth_tx_hash)
+            except Exception as e:
+                print("type(Exception):", type(e))
+                if "already known" in str(e):
+                    # The transaction is already in the mempool
+                    # We can extract the transaction hash from the signed transaction
+                    eth_tx_hash = w3.to_hex(w3.keccak(signed_tx_as_bytes))
+                    logger.info(f"Transaction already in mempool: {eth_tx_hash}")
+                else:
+                    # If it's a different error, re-raise it
+                    raise
+            
             # Create a database record
             session = Session()
             new_unwrap = UnwrapTransaction(
-                eth_tx_hash=eth_tx_hash.hex(),
+                eth_tx_hash=eth_tx_hash,
                 status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED,
                 amount=amount_btc,
                 wallet_id=wallet_id,
@@ -290,7 +312,7 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
             session.commit()
             session.close()
 
-            return {"eth_tx_hash": eth_tx_hash.hex(), "status": TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED}
+            return {"eth_tx_hash": eth_tx_hash, "status": TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED}
         else:
             logger.warning("Transaction is not a burn function call")
             raise ValueError("Transaction is not a burn function call")
@@ -324,18 +346,18 @@ async def unwrap_status(eth_tx_hash: str):
 @app.get("/wrap-history/{wallet_id}")
 async def wrap_history(wallet_id: str):
     session = Session()
-    wrap_txs = session.query(WrapTransaction).filter(WrapTransaction.wallet_id == wallet_id).all()
+    wrap_txs: List[WrapTransaction] = session.query(WrapTransaction).filter(WrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"btc_tx_id": tx.btc_tx_id, "status": tx.status, "amount": tx.amount} for tx in wrap_txs]
+    return [{"btc_tx_id": tx.btc_tx_id, "status": tx.status, "amount": tx.amount, "eth_tx_hash": tx.eth_tx_hash, "receiving_address": tx.receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in wrap_txs]
 
 @app.get("/unwrap-history/{wallet_id}")
 async def unwrap_history(wallet_id: str):
     session = Session()
-    unwrap_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.wallet_id == wallet_id).all()
+    unwrap_txs: List[UnwrapTransaction] = session.query(UnwrapTransaction).filter(UnwrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount} for tx in unwrap_txs]
+    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount, "btc_tx_id": tx.btc_tx_id, "btc_receiving_address": tx.btc_receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in unwrap_txs]
 
 # Add these new endpoints
 @app.get("/wrap-fee")
@@ -371,7 +393,43 @@ def update_exception_details(tx, exception):
     
     # Save updated exception details
     tx.exception_details = json.dumps(exception_details)
-    tx.exception_count = sum(exception_details.values())
+    tx.exception_count = min(sum(exception_details.values()), MAX_ATTEMPTS)  # Cap at 20 or another suitable maximum
+    tx.last_exception_time = datetime.utcnow()
+
+    if tx.exception_count == MAX_ATTEMPTS:
+        tx.status = TransactionStatus.FAILED_TRANSACTION_MAX_ATTEMPTS
+        logger.error(f"{'wrap' if isinstance(tx, WrapTransaction) else 'unwrap'} Transaction {tx.btc_tx_id if isinstance(tx, WrapTransaction) else tx.eth_tx_hash} failed after {MAX_ATTEMPTS} attempts")
+
+def reset_exception_details(tx):
+    """
+    Reset exception details, count, and last_exception_time for a transaction.
+    
+    :param tx: The transaction object (WrapTransaction or UnwrapTransaction)
+    """
+    tx.exception_details = '{}'
+    tx.exception_count = 0
+    tx.last_exception_time = None
+
+def should_process_transaction(tx):
+    """
+    Determine if a transaction should be processed based on exponential backoff.
+    
+    :param tx: The transaction object (WrapTransaction or UnwrapTransaction)
+    :return: Boolean indicating whether the transaction should be processed
+    """
+    if tx.last_exception_time is None:
+        return True
+    
+    # Add a maximum backoff time (e.g., 1 day)
+    max_backoff_minutes = 24 * 60  # 1 day in minutes
+    
+    backoff_time = min(2 ** tx.exception_count, max_backoff_minutes)  # Exponential backoff with a maximum
+    next_process_time = tx.last_exception_time + timedelta(minutes=backoff_time)
+    logger.info(f"""id: {tx.id} eth_tx_hash: {tx.eth_tx_hash} next_process_time: {next_process_time} current_time: {datetime.utcnow()} 
+                backoff_time: {backoff_time} tx.last_exception_time: {tx.last_exception_time} 
+                timedelta(minutes=backoff_time): {timedelta(minutes=backoff_time)}""")
+    
+    return datetime.utcnow() >= next_process_time
 
 async def process_wrap_transactions():
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
@@ -380,6 +438,9 @@ async def process_wrap_transactions():
     broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED).all()
 
     for tx in broadcasted_txs:
+        if not should_process_transaction(tx):
+            continue
+        
         try:
             # Check Bitcoin transaction confirmation
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
@@ -393,6 +454,9 @@ async def process_wrap_transactions():
                 gas_price = w3.eth.gas_price
                 if gas_price > MaxGasPrice:
                     gas_price = MaxGasPrice
+
+                logger.info(f"mintinggas_price: {gas_price}")
+
                 nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                 chain_id = w3.eth.chain_id  # Get the current chain ID
                 mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
@@ -408,8 +472,11 @@ async def process_wrap_transactions():
 
                 tx.status = TransactionStatus.WBTC_MINTING_IN_PROGRESS
                 tx.eth_tx_hash = eth_tx_hash.hex()
-        except JSONRPCException as e:
-            logger.error(f"process_wrap_transactions JSONRPC error for transaction {tx.btc_tx_id}: {e}")
+
+                # If successful, reset exception details
+                reset_exception_details(tx)
+        except Exception as e:
+            logger.error(f"process_wrap_transactions error for transaction {tx.btc_tx_id}: {e}")
             update_exception_details(tx, e)
             continue
 
@@ -426,6 +493,7 @@ async def process_wrap_transactions():
             else:
                 logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
                 tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
+            reset_exception_details(tx)
         except Exception as e:
             logger.error(f"wrap Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
             update_exception_details(tx, e)
@@ -441,6 +509,9 @@ async def process_unwrap_transactions():
     rpc_connection = AuthServiceProxy(btc_node_wallet_url)
     
     for tx in initiated_txs:
+        if not should_process_transaction(tx):
+            continue
+        
         try:
             eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
             if eth_tx_receipt:
@@ -487,6 +558,8 @@ async def process_unwrap_transactions():
                     logger.error(f"unwrap Transaction {tx.eth_tx_hash} failed with status 0")
                     continue
 
+                # If successful, reset exception details
+                reset_exception_details(tx)
         except Exception as e:
             logger.error(f"unwrap Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
             update_exception_details(tx, e)
@@ -497,6 +570,9 @@ async def process_unwrap_transactions():
     confirming_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMING).all()
 
     for tx in confirming_txs:
+        if not should_process_transaction(tx):
+            continue
+        
         try:
             eth_tx_receipt = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
             # Check the number of confirmations
@@ -507,6 +583,7 @@ async def process_unwrap_transactions():
                 tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMED
             else:
                 logger.info(f"Transaction {tx.eth_tx_hash} not yet confirmed")
+            reset_exception_details(tx)
         except Exception as e:
             logger.error(f"unwrap Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
             update_exception_details(tx, e)
@@ -517,6 +594,9 @@ async def process_unwrap_transactions():
     confirmed_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMED).all()
 
     for tx in confirmed_txs:
+        if not should_process_transaction(tx):
+            continue
+        
         try:
             # Fetch unspent transactions to use as inputs
                 
@@ -563,22 +643,32 @@ async def process_unwrap_transactions():
             tx.status = TransactionStatus.UNWRAP_BTC_TRANSACTION_BROADCASTED
             tx.btc_tx_id = btc_tx_id
 
+            # If successful, reset exception details
+            reset_exception_details(tx)
         except Exception as e:
             logger.error(f"Error creating Bitcoin transaction for {tx.eth_tx_hash}: {e}")
             update_exception_details(tx, e)
+            continue
 
     session.commit()
 
     broadcasted_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_BTC_TRANSACTION_BROADCASTED).all()
 
     for tx in broadcasted_txs:
+        if not should_process_transaction(tx):
+            continue
+        
         try:
             btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
             if btc_tx['confirmations'] >= 6:
                 tx.status = TransactionStatus.UNWRAP_COMPLETED
+            # If successful, reset exception details
+            reset_exception_details(tx)
+
         except Exception as e:
             logger.error(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
             update_exception_details(tx, e)
+            continue
 
     session.commit()
     session.close()

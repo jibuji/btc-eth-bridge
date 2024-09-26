@@ -2,8 +2,8 @@
   "_format": "hh-sol-cache-2",
   "files": {
     "/home/buji/code/bitbi/eth-bridge3/contracts/WBTC.sol": {
-      "lastModificationDate": 1727076674031,
-      "contentHash": "b4e51ed2496ddb0b3106228c9fee073f",
+      "lastModificationDate": 1727223871722,
+      "contentHash": "64bdbb1918d6c9ae68d38b9f71dd0353",
       "sourceName": "contracts/WBTC.sol",
       "solcConfig": {
         "version": "0.8.20",
