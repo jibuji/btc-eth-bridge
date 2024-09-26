@@ -89,6 +89,7 @@ def create_and_send_btc_transaction(recipient_address, amount_btc, wallet_id):
         print(f"An error occurred: {e}")
         return None
 
+MaxGasPrice = 100*10**9 # 100 Gwei
 def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_address):
     try:
         nonce = w3.eth.get_transaction_count(os.getenv("ETH_SENDER_ADDRESS"))
@@ -104,12 +105,15 @@ def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_addres
         print("custom_data:", custom_data)
         # Prepare the burn function call with both arguments
         burn_function = wbtc_contract.functions.burn(satoshis, custom_data)
-        print("gas_price:", w3.eth.gas_price)
+        gas_price = w3.eth.gas_price
+        if gas_price > MaxGasPrice:
+            gas_price = MaxGasPrice
+        print("gas_price:", gas_price/10**9)
         # Prepare transaction data
         transaction = burn_function.build_transaction({
             'chainId': chain_id,
             'gas': 2000000,
-            'gasPrice': int(w3.eth.gas_price/10),
+            'gasPrice': int(gas_price),
             'nonce': nonce,
         })
         

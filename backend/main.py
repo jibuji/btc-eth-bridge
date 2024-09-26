@@ -19,18 +19,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 import uvicorn
 import asyncio
 import binascii
-import re
-import time
 from bitcoinrpc.authproxy import JSONRPCException
 from enum import Enum
-from web3.exceptions import TransactionNotFound,Web3ValueError
-from datetime import datetime, timedelta
-import rlp
-from eth_utils import decode_hex
 from eth_abi.codec import ABICodec
 from eth_abi.registry import registry
-from web3.types import TxData
-from web3._utils.transactions import Transaction
+from eth.vm.forks.arrow_glacier.transactions import ArrowGlacierTransactionBuilder as TransactionBuilder
+from eth_utils import to_bytes, encode_hex
+from web3.auto import w3
+
 
 MIN_AMOUNT = 1000
 
@@ -38,7 +34,7 @@ MIN_AMOUNT = 1000
 BTC_FEE = Decimal('0.01')
 ETH_FEE_IN_WBTC = 100
 TokenUnit = 100000000
-
+MaxGasPrice = 100*10**9 # 100 Gwei
 load_dotenv()
 
 def setup_logging():
@@ -224,31 +220,49 @@ async def initiate_wrap(wrap_request: WrapRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# Create an instance of ABICodec
-abi_codec = ABICodec(registry)
 
 @app.post("/initiate-unwrap/")
 async def initiate_unwrap(unwrap_request: UnwrapRequest):
     try:
-        # Decode the raw transaction using rlp
-        decoded_tx = rlp.decode(decode_hex(unwrap_request.signed_eth_tx), Transaction)
+        # Convert the hex string to bytes
+        signed_tx_as_bytes = to_bytes(hexstr=unwrap_request.signed_eth_tx)
 
-        # Get the input data
-        input_data = decoded_tx.data
+        # Decode the transaction
+        decoded_tx = TransactionBuilder().decode(signed_tx_as_bytes)
+        logger.info(f"decoded_tx: {decoded_tx}")
         
+        # Convert the to_address bytes to a checksum address
+        to_address = w3.to_checksum_address(decoded_tx.to)
+        logger.info(f"to_address: {to_address}")
+        
+        # Convert the wbtc_address to a checksum address
+        wbtc_checksum_address = w3.to_checksum_address(wbtc_address)
+        
+        if to_address != wbtc_checksum_address:
+            raise ValueError(f"Transaction is not to the right WBTC contract. current to_address: {to_address}, expected: {wbtc_checksum_address}")
+        
+        
+        # Extract the input data (which contains the function call and arguments)
+        input_data = decoded_tx.data
+
         # The first 4 bytes are the function selector
         function_selector = input_data[:4]
-        
-        # The rest is the encoded arguments
-        encoded_args = input_data[4:]
-        
+
         # Check if it's the burn function
-        burn_selector = Web3.keccak(text="burn(uint256,bytes)")[:4].hex()
-        
-        if function_selector.hex() == burn_selector:
+        burn_selector = w3.keccak(text="burn(uint256,bytes)")[:4]
+
+        if function_selector == burn_selector:
             # Decode the arguments
-            decoded_args = abi_codec.decode(['uint256', 'bytes'], encoded_args)
-            amount, data = decoded_args
+            decoded_args = w3.eth.contract(abi=[{
+                "inputs": [
+                    {"type": "uint256", "name": "amount"},
+                    {"type": "bytes", "name": "data"}
+                ],
+                "name": "burn",
+                "type": "function"
+            }]).decode_function_input(input_data)
+
+            amount, data = decoded_args[1]['amount'], decoded_args[1]['data']
             
             # Convert amount from satoshis to BTC
             amount_btc = amount / 1e8
@@ -258,25 +272,29 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
             
             logger.info(f"Burn amount: {amount_btc} BTC")
             logger.info(f"Burn data: {decoded_data}")
+            wallet_id, btc_receiving_address = decoded_data.split(':')[1].split('-')
+
+            # Broadcast the transaction
+            eth_tx_hash = w3.eth.send_raw_transaction(signed_tx_as_bytes)
+
+            # Create a database record
+            session = Session()
+            new_unwrap = UnwrapTransaction(
+                eth_tx_hash=eth_tx_hash.hex(),
+                status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED,
+                amount=amount_btc,
+                wallet_id=wallet_id,
+                btc_receiving_address=btc_receiving_address
+            )
+            session.add(new_unwrap)
+            session.commit()
+            session.close()
+
+            return {"eth_tx_hash": eth_tx_hash.hex(), "status": TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED}
         else:
             logger.warning("Transaction is not a burn function call")
+            raise ValueError("Transaction is not a burn function call")
 
-        # Broadcast the transaction
-        eth_tx_hash = w3.eth.send_raw_transaction(unwrap_request.signed_eth_tx)
-
-        # Create a database record
-        session = Session()
-        new_unwrap = UnwrapTransaction(
-            eth_tx_hash=eth_tx_hash.hex(),
-            status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED,
-            amount=amount_btc,  # Store the decoded amount
-            # You might want to parse and store other information from decoded_data
-        )
-        session.add(new_unwrap)
-        session.commit()
-        session.close()
-
-        return {"eth_tx_hash": eth_tx_hash.hex(), "status": TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED}
     except Exception as e:
         logger.error(f"Error in initiate_unwrap: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -372,11 +390,14 @@ async def process_wrap_transactions():
                 satoshis -= ETH_FEE_IN_WBTC * TokenUnit
                 
                 # Mint WBTC
+                gas_price = w3.eth.gas_price
+                if gas_price > MaxGasPrice:
+                    gas_price = MaxGasPrice
                 nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                 chain_id = w3.eth.chain_id  # Get the current chain ID
                 mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
                     'chainId': chain_id,
-                    'gasPrice': w3.eth.gas_price,
+                    'gasPrice': int(gas_price),
                     'nonce': nonce,
                     'gas': 2000000
                 })
@@ -406,7 +427,7 @@ async def process_wrap_transactions():
                 logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
                 tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
         except Exception as e:
-            logger.error(f"Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
+            logger.error(f"wrap Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
             update_exception_details(tx, e)
             continue
 
@@ -463,11 +484,11 @@ async def process_unwrap_transactions():
                         continue
                 elif eth_tx_receipt['status'] == 0:
                     tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
-                    logger.error(f"Transaction {tx.eth_tx_hash} failed with status 0")
+                    logger.error(f"unwrap Transaction {tx.eth_tx_hash} failed with status 0")
                     continue
 
         except Exception as e:
-            logger.error(f"Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
+            logger.error(f"unwrap Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
             update_exception_details(tx, e)
             continue
 
@@ -487,7 +508,7 @@ async def process_unwrap_transactions():
             else:
                 logger.info(f"Transaction {tx.eth_tx_hash} not yet confirmed")
         except Exception as e:
-            logger.error(f"Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
+            logger.error(f"unwrap Error processing transaction eth_tx_hash: {tx.eth_tx_hash}, error: {e}")
             update_exception_details(tx, e)
             continue
 
