@@ -177,6 +177,7 @@ class UnwrapTransaction(Base):
     amount = Column(Float, nullable=True)
     status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
     btc_tx_id = Column(String, nullable=True)
+    eth_sender = Column(String, nullable=True)  # New column
     # New columns
     exception_details = Column(Text, default='{}')
     exception_count = Column(Integer, default=0)
@@ -289,6 +290,10 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
             logger.info(f"Burn data: {decoded_data}")
             wallet_id, btc_receiving_address = decoded_data.split(':')[1].split('-')
 
+            # Extract the 'from' address from the decoded transaction
+            eth_sender = w3.to_checksum_address(decoded_tx.sender)
+            logger.info(f"eth_sender: {eth_sender}")
+
             # Broadcast the transaction
             eth_tx_hash = None
             try:
@@ -312,7 +317,8 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
                 status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED,
                 amount=amount_btc,
                 wallet_id=wallet_id,
-                btc_receiving_address=btc_receiving_address
+                btc_receiving_address=btc_receiving_address,
+                eth_sender=eth_sender  # Add the eth_sender to the new record
             )
             session.add(new_unwrap)
             session.commit()
@@ -363,7 +369,7 @@ async def unwrap_history(wallet_id: str):
     unwrap_txs: List[UnwrapTransaction] = session.query(UnwrapTransaction).filter(UnwrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount, "btc_tx_id": tx.btc_tx_id, "btc_receiving_address": tx.btc_receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in unwrap_txs]
+    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount, "btc_tx_id": tx.btc_tx_id, "btc_receiving_address": tx.btc_receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time, "eth_sender": tx.eth_sender} for tx in unwrap_txs]
 
 # Add these new endpoints
 @app.get("/wrap-fee")
@@ -378,6 +384,42 @@ async def get_unwrap_fee():
     return {
         "btc_fee": float(BTC_FEE),
         "eth_gas_price": w3.eth.gas_price
+    }
+
+@app.get("/unwrap-eth-transaction-count/{address}")
+async def get_unwrap_eth_transaction_count(address: str):
+    try:
+        # Ensure the address is valid
+        if not w3.is_address(address):
+            raise HTTPException(status_code=400, detail="Invalid Ethereum address")
+        
+        # Get the transaction count (nonce) from the Ethereum network
+        eth_nonce = w3.eth.get_transaction_count(address)
+        print("eth_nonce:", eth_nonce)
+        # Get the count of unwrap transactions for this address
+        session = Session()
+        unwrap_count = session.query(UnwrapTransaction).filter(UnwrapTransaction.eth_sender == address).count()
+        session.close()
+        
+        # Use the maximum of eth_nonce and unwrap_count as the final nonce
+        final_nonce = max(eth_nonce, unwrap_count)
+        
+        return {
+            "address": address,
+            "eth_transaction_count": eth_nonce,
+            "unwrap_transaction_count": unwrap_count,
+            "final_nonce": final_nonce
+        }
+    except Exception as e:
+        logger.error(f"Error getting transaction count for address {address}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add this new endpoint near the other endpoint definitions
+@app.get("/bridge-addresses")
+async def get_bridge_addresses():
+    return {
+        "btc_bridge_address": bridge_btc_address,
+        "eth_bridge_contract_address": wbtc_address
     }
 
 # Background tasks (to be run periodically)
@@ -457,7 +499,7 @@ async def process_wrap_transactions():
                 satoshis -= ETH_FEE_IN_WBTC * TokenUnit
                 
                 # Mint WBTC
-                gas_price = w3.eth.gas_price
+                gas_price = int(w3.eth.gas_price * 1.1)
                 if gas_price > MaxGasPrice:
                     gas_price = MaxGasPrice
 
@@ -626,7 +668,7 @@ async def process_unwrap_transactions():
             total_amount = sum(Decimal(str(input['amount'])) for input in unspent)
 
             if total_amount < total_needed:
-                logger.error("Not enough funds to create the transaction")
+                logger.error(f"Not enough funds to create the transaction total_amount: {total_amount} total_needed: {total_needed}")
                 raise Exception("Not enough funds to create the transaction")
 
             # Prepare inputs and outputs

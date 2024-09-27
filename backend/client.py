@@ -89,11 +89,32 @@ def create_and_send_btc_transaction(recipient_address, amount_btc, wallet_id):
         print(f"An error occurred: {e}")
         return None
 
-MaxGasPrice = 70*10**9 # 100 Gwei
+MaxGasPrice = 400*10**9 # 100 Gwei
+
+def get_unwrap_eth_transaction_count(address):
+    try:
+        response = requests.get(f"{SERVER_URL}/unwrap-eth-transaction-count/{address}")
+        if response.status_code == 200:
+            return response.json()['final_nonce']
+        else:
+            print(f"Failed to get transaction count. Status code: {response.status_code}")
+            print(f"Response content: {response.text}")
+            return None
+    except Exception as e:
+        print(f"An error occurred while getting transaction count: {e}")
+        return None
+
 def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_address):
     try:
-        nonce = w3.eth.get_transaction_count(os.getenv("ETH_SENDER_ADDRESS"))
+        sender_address = os.getenv("ETH_SENDER_ADDRESS")
+        nonce = get_unwrap_eth_transaction_count(sender_address)
         
+        if nonce is None:
+            print("Failed to get transaction count from server. Aborting transaction.")
+            return None
+        
+        print("nonce:", nonce)
+
         # Get the current chain ID
         chain_id = w3.eth.chain_id
 
@@ -105,14 +126,14 @@ def create_and_send_eth_transaction(wbtc_amount, wallet_id, btc_receiving_addres
         print("custom_data:", custom_data)
         # Prepare the burn function call with both arguments
         burn_function = wbtc_contract.functions.burn(satoshis, custom_data)
-        gas_price = w3.eth.gas_price
+        gas_price = int(w3.eth.gas_price * 1.1)
         if gas_price > MaxGasPrice:
             gas_price = MaxGasPrice
         print("gas_price:", gas_price/10**9)
         # Prepare transaction data
         transaction = burn_function.build_transaction({
             'chainId': chain_id,
-            'gas': 2100000,
+            'gas': 500000,
             'gasPrice': int(gas_price),
             'nonce': nonce,
         })
