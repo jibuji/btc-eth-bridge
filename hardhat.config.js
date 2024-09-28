@@ -1,15 +1,17 @@
-require("@nomiclabs/hardhat-waffle");
-require("dotenv").config();
+require("@nomicfoundation/hardhat-toolbox");
+require("@openzeppelin/hardhat-upgrades");
+require('dotenv').config();
+
 
 module.exports = {
   solidity: "0.8.20",
   networks: {
     sepolia: {
-      url: process.env.SEPOLIA_RPC_URL,
+      url: `https://sepolia.infura.io/v3/${process.env.INFURA_PROJECT_ID}`,
       accounts: [process.env.PRIVATE_KEY]
     },
     holesky: {
-      url: process.env.HOLESKY_RPC_URL,
+      url: `https://holesky.infura.io/v3/${process.env.INFURA_PROJECT_ID}`,
       accounts: [process.env.PRIVATE_KEY]
     }
   }
