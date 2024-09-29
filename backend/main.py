@@ -34,8 +34,8 @@ import time
 MIN_AMOUNT = 1000
 
 # Add these constants near the top of the file
-BTC_FEE = Decimal('0.01')
-ETH_FEE_IN_WBTC = 100
+BTB_FEE = Decimal('0.01')
+ETH_FEE_IN_WBTB = 100
 TokenUnit = 100000000
 MaxGasPrice = 400*10**9 # 200 Gwei
 MAX_ATTEMPTS = 20
@@ -96,10 +96,10 @@ app = FastAPI(lifespan=lifespan)
 
 # Ethereum setup
 w3 = Web3(Web3.HTTPProvider(os.getenv("ETH_NODE_URL")))
-wbtc_address = os.getenv("WBTC_ADDRESS")
+wbtb_address = os.getenv("WBTB_ADDRESS")
 
 # Read the ABI from a JSON file instead of the Solidity file
-abi_file_path = Path("../artifacts/contracts/WBTC.sol/WBTC.json")
+abi_file_path = Path("../artifacts/contracts/WBTB.sol/WBTB.json")
 if abi_file_path.exists():
     with open(abi_file_path, "r") as file:
         contract_abi = json.load(file)['abi']
@@ -107,23 +107,23 @@ else:
     raise FileNotFoundError(f"ABI file not found: {abi_file_path}")
 
 # Create the contract instance
-compiled_sol = w3.eth.contract(address=wbtc_address, abi=contract_abi)
+compiled_sol = w3.eth.contract(address=wbtb_address, abi=contract_abi)
 
-# Bitcoin setup
-btc_node_url = os.getenv("BTC_NODE_URL")
-btc_wallet_name = os.getenv('BTC_WALLET_NAME')
+# Bitbi setup
+btb_node_url = os.getenv("BTB_NODE_URL")
+btb_wallet_name = os.getenv('BTB_WALLET_NAME')
 
-rpc_connection = AuthServiceProxy(btc_node_url)
+rpc_connection = AuthServiceProxy(btb_node_url)
 # Load the wallet
 try:
-    rpc_connection.loadwallet(btc_wallet_name)
+    rpc_connection.loadwallet(btb_wallet_name)
 except Exception as e:
     logger.error(f"Failed to load wallet: {e}")
 
 # Instead of creating a new AuthServiceProxy, update the existing one
-btc_node_wallet_url = f"{btc_node_url}/wallet/{btc_wallet_name}"
+btb_node_wallet_url = f"{btb_node_url}/wallet/{btb_wallet_name}"
 
-bridge_btc_address = os.getenv('BRIDGE_BTC_ADDRESS')
+bridge_btb_address = os.getenv('BRIDGE_BTB_ADDRESS')
 
 
 # Database setup
@@ -133,18 +133,18 @@ Session = sessionmaker(bind=engine)
 
 class TransactionStatus(str, Enum):
     # Wrap statuses
-    WRAP_BTC_TRANSACTION_BROADCASTED = "WRAP_BTC_TRANSACTION_BROADCASTED"
-    WRAP_BTC_TRANSACTION_CONFIRMING = "WRAP_BTC_TRANSACTION_CONFIRMING"
-    WBTC_MINTING_IN_PROGRESS = "WBTC_MINTING_IN_PROGRESS"
+    WRAP_BTB_TRANSACTION_BROADCASTED = "WRAP_BTB_TRANSACTION_BROADCASTED"
+    WRAP_BTB_TRANSACTION_CONFIRMING = "WRAP_BTB_TRANSACTION_CONFIRMING"
+    WBTB_MINTING_IN_PROGRESS = "WBTB_MINTING_IN_PROGRESS"
     WRAP_COMPLETED = "WRAP_COMPLETED"
 
     # Unwrap statuses
     UNWRAP_ETH_TRANSACTION_INITIATED = "UNWRAP_ETH_TRANSACTION_INITIATED"
     UNWRAP_ETH_TRANSACTION_CONFIRMING = "UNWRAP_ETH_TRANSACTION_CONFIRMING"
     UNWRAP_ETH_TRANSACTION_CONFIRMED = "UNWRAP_ETH_TRANSACTION_CONFIRMED"
-    WBTC_BURN_CONFIRMED = "WBTC_BURN_CONFIRMED"
-    UNWRAP_BTC_TRANSACTION_CREATING = "UNWRAP_BTC_TRANSACTION_CREATING"
-    UNWRAP_BTC_TRANSACTION_BROADCASTED = "UNWRAP_BTC_TRANSACTION_BROADCASTED"
+    WBTB_BURN_CONFIRMED = "WBTB_BURN_CONFIRMED"
+    UNWRAP_BTB_TRANSACTION_CREATING = "UNWRAP_BTB_TRANSACTION_CREATING"
+    UNWRAP_BTB_TRANSACTION_BROADCASTED = "UNWRAP_BTB_TRANSACTION_BROADCASTED"
     UNWRAP_COMPLETED = "UNWRAP_COMPLETED"
 
     # Failure statuses
@@ -156,12 +156,13 @@ class TransactionStatus(str, Enum):
 class WrapTransaction(Base):
     __tablename__ = "wrap_transactions"
     id = Column(Integer, primary_key=True, index=True)
-    btc_tx_id = Column(String, unique=True, index=True)
+    btb_tx_id = Column(String, unique=True, index=True)
     wallet_id = Column(String, index=True)
     receiving_address = Column(String)
     amount = Column(Float)
-    status = Column(String, default=TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED)
+    status = Column(String, default=TransactionStatus.WRAP_BTB_TRANSACTION_BROADCASTED)
     eth_tx_hash = Column(String)
+    minted_wbtb_amount = Column(Float)  # New column
     
     exception_details = Column(Text, default='{}')
     exception_count = Column(Integer, default=0)
@@ -173,10 +174,10 @@ class UnwrapTransaction(Base):
     id = Column(Integer, primary_key=True, index=True)
     eth_tx_hash = Column(String, unique=True, index=True)
     wallet_id = Column(String, index=True, nullable=True)
-    btc_receiving_address = Column(String, nullable=True)
+    btb_receiving_address = Column(String, nullable=True)
     amount = Column(Float, nullable=True)
     status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
-    btc_tx_id = Column(String, nullable=True)
+    btb_tx_id = Column(String, nullable=True)
     eth_sender = Column(String, nullable=True)  # New column
     # New columns
     exception_details = Column(Text, default='{}')
@@ -187,7 +188,7 @@ class UnwrapTransaction(Base):
 Base.metadata.create_all(bind=engine)
 
 class WrapRequest(BaseModel):
-    signed_btc_tx: str
+    signed_btb_tx: str
 
 class UnwrapRequest(BaseModel):
     signed_eth_tx: str
@@ -195,10 +196,10 @@ class UnwrapRequest(BaseModel):
 @app.post("/initiate-wrap/")
 async def initiate_wrap(wrap_request: WrapRequest):
     try:
-        logger.info(f"received signed btc tx: {wrap_request.signed_btc_tx}")
-        rpc_connection = AuthServiceProxy(btc_node_wallet_url)
-        # Decode and extract information from the signed Bitcoin transaction
-        decoded_tx = rpc_connection.decoderawtransaction(wrap_request.signed_btc_tx)
+        logger.info(f"received signed btb tx: {wrap_request.signed_btb_tx}")
+        rpc_connection = AuthServiceProxy(btb_node_wallet_url)
+        # Decode and extract information from the signed Bitbi transaction
+        decoded_tx = rpc_connection.decoderawtransaction(wrap_request.signed_btb_tx)
         logger.info(f"decoded tx: {decoded_tx}")
         op_return_data = next(output['scriptPubKey']['asm'] for output in decoded_tx['vout'] if output['scriptPubKey']['type'] == 'nulldata')
         logger.info(f"op return data: {op_return_data}")
@@ -211,28 +212,28 @@ async def initiate_wrap(wrap_request: WrapRequest):
         logger.info(f"wallet id: {wallet_id}")
         logger.info(f"receiving address: {receiving_address}")
         amount = sum(output['value'] for output in decoded_tx['vout'] 
-                     if output['scriptPubKey'].get('address') == bridge_btc_address)
-        logger.info(f"Amount sent to bridge address: {amount} BTC")
+                     if output['scriptPubKey'].get('address') == bridge_btb_address)
+        logger.info(f"Amount sent to bridge address: {amount} btb")
         if amount < MIN_AMOUNT:
-            raise Exception(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC")
+            raise Exception(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} btb")
         
         # Broadcast the transaction
-        btc_tx_id = rpc_connection.sendrawtransaction(wrap_request.signed_btc_tx)
+        btb_tx_id = rpc_connection.sendrawtransaction(wrap_request.signed_btb_tx)
 
         # Create a database record
         session = Session()
         new_wrap = WrapTransaction(
-            btc_tx_id=btc_tx_id,
+            btb_tx_id=btb_tx_id,
             wallet_id=wallet_id,
             receiving_address=receiving_address,
             amount=amount,
-            status=TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED
+            status=TransactionStatus.WRAP_BTB_TRANSACTION_BROADCASTED
         )
         session.add(new_wrap)
         session.commit()
         session.close()
 
-        return {"btc_tx_id": btc_tx_id, "status": TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED}
+        return {"btb_tx_id": btb_tx_id, "status": TransactionStatus.WRAP_BTB_TRANSACTION_BROADCASTED}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -251,11 +252,11 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
         to_address = w3.to_checksum_address(decoded_tx.to)
         logger.info(f"to_address: {to_address}")
         
-        # Convert the wbtc_address to a checksum address
-        wbtc_checksum_address = w3.to_checksum_address(wbtc_address)
+        # Convert the wbtb_address to a checksum address
+        wbtb_checksum_address = w3.to_checksum_address(wbtb_address)
         
-        if to_address != wbtc_checksum_address:
-            raise ValueError(f"Transaction is not to the right WBTC contract. current to_address: {to_address}, expected: {wbtc_checksum_address}")
+        if to_address != wbtb_checksum_address:
+            raise ValueError(f"Transaction is not to the right WBTB contract. current to_address: {to_address}, expected: {wbtb_checksum_address}")
         
         
         # Extract the input data (which contains the function call and arguments)
@@ -280,15 +281,15 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
 
             amount, data = decoded_args[1]['amount'], decoded_args[1]['data']
             
-            # Convert amount from satoshis to BTC
-            amount_btc = amount / 1e8
+            # Convert amount from satoshis to BTB
+            amount_btb = amount / 1e8
             
             # Decode the data (assuming it's UTF-8 encoded)
             decoded_data = data.decode('utf-8')
             
-            logger.info(f"Burn amount: {amount_btc} BTC")
+            logger.info(f"Burn amount: {amount_btb} BTB")
             logger.info(f"Burn data: {decoded_data}")
-            wallet_id, btc_receiving_address = decoded_data.split(':')[1].split('-')
+            wallet_id, btb_receiving_address = decoded_data.split(':')[1].split('-')
 
             # Extract the 'from' address from the decoded transaction
             eth_sender = w3.to_checksum_address(decoded_tx.sender)
@@ -315,9 +316,9 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
             new_unwrap = UnwrapTransaction(
                 eth_tx_hash=eth_tx_hash,
                 status=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED,
-                amount=amount_btc,
+                amount=amount_btb,
                 wallet_id=wallet_id,
-                btc_receiving_address=btc_receiving_address,
+                btb_receiving_address=btb_receiving_address,
                 eth_sender=eth_sender  # Add the eth_sender to the new record
             )
             session.add(new_unwrap)
@@ -333,10 +334,10 @@ async def initiate_unwrap(unwrap_request: UnwrapRequest):
         logger.error(f"Error in initiate_unwrap: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/wrap-status/{btc_tx_id}")
-async def wrap_status(btc_tx_id: str):
+@app.get("/wrap-status/{btb_tx_id}")
+async def wrap_status(btb_tx_id: str):
     session = Session()
-    wrap_tx = session.query(WrapTransaction).filter(WrapTransaction.btc_tx_id == btc_tx_id).first()
+    wrap_tx = session.query(WrapTransaction).filter(WrapTransaction.btb_tx_id == btb_tx_id).first()
     session.close()
 
     if not wrap_tx:
@@ -353,7 +354,7 @@ async def unwrap_status(eth_tx_hash: str):
     if not unwrap_tx:
         raise HTTPException(status_code=404, detail="Unwrap transaction not found")
 
-    return {"status": unwrap_tx.status, "btc_tx_id": unwrap_tx.btc_tx_id}
+    return {"status": unwrap_tx.status, "btb_tx_id": unwrap_tx.btb_tx_id}
 
 @app.get("/wrap-history/{wallet_id}")
 async def wrap_history(wallet_id: str):
@@ -361,7 +362,7 @@ async def wrap_history(wallet_id: str):
     wrap_txs: List[WrapTransaction] = session.query(WrapTransaction).filter(WrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"btc_tx_id": tx.btc_tx_id, "status": tx.status, "amount": tx.amount, "eth_tx_hash": tx.eth_tx_hash, "receiving_address": tx.receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in wrap_txs]
+    return [{"btb_tx_id": tx.btb_tx_id, "status": tx.status, "amount": tx.amount, "eth_tx_hash": tx.eth_tx_hash, "receiving_address": tx.receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in wrap_txs]
 
 @app.get("/unwrap-history/{wallet_id}")
 async def unwrap_history(wallet_id: str):
@@ -369,20 +370,20 @@ async def unwrap_history(wallet_id: str):
     unwrap_txs: List[UnwrapTransaction] = session.query(UnwrapTransaction).filter(UnwrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount, "btc_tx_id": tx.btc_tx_id, "btc_receiving_address": tx.btc_receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time, "eth_sender": tx.eth_sender} for tx in unwrap_txs]
+    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount, "btb_tx_id": tx.btb_tx_id, "btb_receiving_address": tx.btb_receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time, "eth_sender": tx.eth_sender} for tx in unwrap_txs]
 
 # Add these new endpoints
 @app.get("/wrap-fee")
 async def get_wrap_fee():
     return {
-        "btc_fee": float(BTC_FEE),
-        "eth_fee_in_wbtc": ETH_FEE_IN_WBTC
+        "btb_fee": float(BTB_FEE),
+        "eth_fee_in_wbtb": ETH_FEE_IN_WBTB
     }
 
 @app.get("/unwrap-fee")
 async def get_unwrap_fee():
     return {
-        "btc_fee": float(BTC_FEE),
+        "btb_fee": float(BTB_FEE),
         "eth_gas_price": w3.eth.gas_price
     }
 
@@ -418,8 +419,8 @@ async def get_unwrap_eth_transaction_count(address: str):
 @app.get("/bridge-addresses")
 async def get_bridge_addresses():
     return {
-        "btc_bridge_address": bridge_btc_address,
-        "eth_bridge_contract_address": wbtc_address
+        "btb_bridge_address": bridge_btb_address,
+        "eth_bridge_contract_address": wbtb_address
     }
 
 # Background tasks (to be run periodically)
@@ -446,7 +447,7 @@ def update_exception_details(tx, exception):
 
     if tx.exception_count == MAX_ATTEMPTS:
         tx.status = TransactionStatus.FAILED_TRANSACTION_MAX_ATTEMPTS
-        logger.error(f"{'wrap' if isinstance(tx, WrapTransaction) else 'unwrap'} Transaction {tx.btc_tx_id if isinstance(tx, WrapTransaction) else tx.eth_tx_hash} failed after {MAX_ATTEMPTS} attempts")
+        logger.error(f"{'wrap' if isinstance(tx, WrapTransaction) else 'unwrap'} Transaction {tx.btb_tx_id if isinstance(tx, WrapTransaction) else tx.eth_tx_hash} failed after {MAX_ATTEMPTS} attempts")
 
 def reset_exception_details(tx):
     """
@@ -480,25 +481,25 @@ def should_process_transaction(tx):
     return datetime.utcnow() >= next_process_time
 
 async def process_wrap_transactions():
-    rpc_connection = AuthServiceProxy(btc_node_wallet_url)
+    rpc_connection = AuthServiceProxy(btb_node_wallet_url)
 
     session = Session()
-    broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTC_TRANSACTION_BROADCASTED).all()
+    broadcasted_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WRAP_BTB_TRANSACTION_BROADCASTED).all()
 
     for tx in broadcasted_txs:
         if not should_process_transaction(tx):
             continue
         
         try:
-            # Check Bitcoin transaction confirmation
-            btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-            if btc_tx['confirmations'] >= CONFIRMATIONS_REQUIRED:
-                # Convert BTC amount to satoshis, then to Wei
-                satoshis = int(tx.amount * TokenUnit)  # 1 BTC = 100,000,000 satoshis
-                # Deduct the ETH fee in WBTC
-                satoshis -= ETH_FEE_IN_WBTC * TokenUnit
+            # Check Bitbi transaction confirmation
+            btb_tx = rpc_connection.gettransaction(tx.btb_tx_id)
+            if btb_tx['confirmations'] >= CONFIRMATIONS_REQUIRED:
+                # Convert BTB amount to satoshis, then to Wei
+                satoshis = int(tx.amount * TokenUnit)  # 1 BTB = 100,000,000 satoshis
+                # Deduct the ETH fee in WBTB
+                satoshis -= ETH_FEE_IN_WBTB * TokenUnit
                 
-                # Mint WBTC
+                # Mint WBTB
                 gas_price = int(w3.eth.gas_price * 1.1)
                 if gas_price > MaxGasPrice:
                     gas_price = MaxGasPrice
@@ -518,25 +519,25 @@ async def process_wrap_transactions():
                 signed_tx = w3.eth.account.sign_transaction(mint_tx, os.getenv("OWNER_PRIVATE_KEY"))
                 eth_tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-                tx.status = TransactionStatus.WBTC_MINTING_IN_PROGRESS
+                tx.status = TransactionStatus.WBTB_MINTING_IN_PROGRESS
                 tx.eth_tx_hash = eth_tx_hash.hex()
 
                 # If successful, reset exception details
                 reset_exception_details(tx)
         except Exception as e:
-            logger.error(f"process_wrap_transactions error for transaction {tx.btc_tx_id}: {e}")
+            logger.error(f"process_wrap_transactions error for transaction {tx.btb_tx_id}: {e}")
             update_exception_details(tx, e)
             continue
 
     session.commit()
 
-    minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WBTC_MINTING_IN_PROGRESS).all()
+    minting_txs = session.query(WrapTransaction).filter(WrapTransaction.status == TransactionStatus.WBTB_MINTING_IN_PROGRESS).all()
 
     for tx in minting_txs:
         if not should_process_transaction(tx):
             continue
         try:
-            # Check WBTC minting transaction confirmation
+            # Check WBTB minting transaction confirmation
             eth_tx = w3.eth.get_transaction_receipt(tx.eth_tx_hash)
             if eth_tx and eth_tx['status'] == 1:
                 tx.status = TransactionStatus.WRAP_COMPLETED
@@ -556,7 +557,7 @@ async def process_wrap_transactions():
 async def process_unwrap_transactions():
     session = Session()
     initiated_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED).all()
-    rpc_connection = AuthServiceProxy(btc_node_wallet_url)
+    rpc_connection = AuthServiceProxy(btb_node_wallet_url)
     
     for tx in initiated_txs:
         if not should_process_transaction(tx):
@@ -588,16 +589,16 @@ async def process_unwrap_transactions():
                         # check if amount is less than MIN_AMOUNT or amount is not a number
                         if amount < MIN_AMOUNT or math.isnan(amount):
                             tx.status = TransactionStatus.FAILED_INSUFFICIENT_AMOUNT
-                            logger.error(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTC, eth_tx_hash: {tx.eth_tx_hash}")
+                            logger.error(f"Amount sent to bridge address is less than the minimum amount of {MIN_AMOUNT} BTB, eth_tx_hash: {tx.eth_tx_hash}")
                             continue
 
-                        # Extract wallet_id and btc_receiving_address from the _data parameter
+                        # Extract wallet_id and btb_receiving_address from the _data parameter
                         data_param = decoded_input[1]['data'].decode('utf-8')
-                        wallet_id, btc_receiving_address = data_param.split(':')[1].split('-')
+                        wallet_id, btb_receiving_address = data_param.split(':')[1].split('-')
 
                         # Update the database record with extracted information
                         tx.wallet_id = wallet_id
-                        tx.btc_receiving_address = btc_receiving_address
+                        tx.btb_receiving_address = btb_receiving_address
                         tx.amount = amount
                         tx.status = TransactionStatus.UNWRAP_ETH_TRANSACTION_CONFIRMING
                     else:
@@ -650,9 +651,9 @@ async def process_unwrap_transactions():
         try:
             # Fetch unspent transactions to use as inputs
                 
-            bridge_address = os.getenv('BRIDGE_BTC_ADDRESS')
-            amount_to_send = Decimal(str(tx.amount)) - BTC_FEE
-            total_needed = amount_to_send + BTC_FEE
+            bridge_address = os.getenv('BRIDGE_BTB_ADDRESS')
+            amount_to_send = Decimal(str(tx.amount)) - BTB_FEE
+            total_needed = amount_to_send + BTB_FEE
 
             # Fetch unspent UTXOs with minimum amount and sum
             unspent = rpc_connection.listunspent(0, 9999999, [bridge_address], False, {
@@ -674,7 +675,7 @@ async def process_unwrap_transactions():
             # Prepare inputs and outputs
             tx_inputs = [{"txid": input['txid'], "vout": input['vout']} for input in unspent]
             tx_outputs = {
-                tx.btc_receiving_address: float(amount_to_send),
+                tx.btb_receiving_address: float(amount_to_send),
             }
 
             # Calculate change and add it if it's not dust
@@ -684,43 +685,43 @@ async def process_unwrap_transactions():
 
             logger.info(f"tx_outputs: {tx_outputs}")
             # Format OP_RETURN data as hexadecimal
-            op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTC_RECEIVE_ADDRESS')}"
+            op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTB_RECEIVE_ADDRESS')}"
             op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
             tx_outputs["data"] = op_return_hex
 
             # Create raw transaction
-            btc_tx = rpc_connection.createrawtransaction(tx_inputs, tx_outputs)
+            btb_tx = rpc_connection.createrawtransaction(tx_inputs, tx_outputs)
 
-            signed_tx = rpc_connection.signrawtransactionwithwallet(btc_tx)
-            btc_tx_id = rpc_connection.sendrawtransaction(signed_tx['hex'])
+            signed_tx = rpc_connection.signrawtransactionwithwallet(btb_tx)
+            btb_tx_id = rpc_connection.sendrawtransaction(signed_tx['hex'])
 
-            tx.status = TransactionStatus.UNWRAP_BTC_TRANSACTION_BROADCASTED
-            tx.btc_tx_id = btc_tx_id
+            tx.status = TransactionStatus.UNWRAP_BTB_TRANSACTION_BROADCASTED
+            tx.btb_tx_id = btb_tx_id
 
             # If successful, reset exception details
             reset_exception_details(tx)
         except Exception as e:
-            logger.error(f"Error creating Bitcoin transaction for {tx.eth_tx_hash}: {e}")
+            logger.error(f"Error creating Bitbi transaction for {tx.eth_tx_hash}: {e}")
             update_exception_details(tx, e)
             continue
 
     session.commit()
 
-    broadcasted_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_BTC_TRANSACTION_BROADCASTED).all()
+    broadcasted_txs = session.query(UnwrapTransaction).filter(UnwrapTransaction.status == TransactionStatus.UNWRAP_BTB_TRANSACTION_BROADCASTED).all()
 
     for tx in broadcasted_txs:
         if not should_process_transaction(tx):
             continue
         
         try:
-            btc_tx = rpc_connection.gettransaction(tx.btc_tx_id)
-            if btc_tx['confirmations'] >= CONFIRMATIONS_REQUIRED:
+            btb_tx = rpc_connection.gettransaction(tx.btb_tx_id)
+            if btb_tx['confirmations'] >= CONFIRMATIONS_REQUIRED:
                 tx.status = TransactionStatus.UNWRAP_COMPLETED
             # If successful, reset exception details
             reset_exception_details(tx)
 
         except Exception as e:
-            logger.error(f"Error checking Bitcoin transaction {tx.btc_tx_id}: {e}")
+            logger.error(f"Error checking Bitbi transaction {tx.btb_tx_id}: {e}")
             update_exception_details(tx, e)
             continue
 

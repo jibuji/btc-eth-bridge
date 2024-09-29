@@ -15,7 +15,7 @@ w3 = Web3(Web3.HTTPProvider(os.getenv("ETH_NODE_URL")))
 wbtc_address = os.getenv("WBTC_ADDRESS")
 
 # Read the ABI from a JSON file
-abi_file_path = "../artifacts/contracts/WBTC.sol/WBTC.json"
+abi_file_path = "../artifacts/contracts/WBTB.sol/WBTB.json"
 with open(abi_file_path, "r") as file:
     contract_abi = json.load(file)['abi']
 
@@ -189,9 +189,9 @@ def get_unwrap_history(wallet_id):
         return None
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="WBTC Wrap/Unwrap Client")
+    parser = argparse.ArgumentParser(description="WBTB Wrap/Unwrap Client")
     parser.add_argument('action', choices=['wrap', 'unwrap', 'wrap-status', 'unwrap-status', 'wrap-history', 'unwrap-history'], help="Action to perform")
-    parser.add_argument('--amount', type=float, help="Amount of BTC to wrap or WBTC to unwrap")
+    parser.add_argument('--amount', type=float, help="Amount of BTC to wrap or WBTB to unwrap")
     parser.add_argument('--wallet-id', type=str, help="Wallet ID for the transaction")
     parser.add_argument('--tx-id', type=str, help="Transaction ID for status check")
     

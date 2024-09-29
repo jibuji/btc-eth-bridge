@@ -4,26 +4,36 @@ const { ethers, run } = require("hardhat");
 async function main() {
     // Compile the contracts
     await run('compile');
-    // Get the private key from the .env file
-    const privateKey = process.env.PRIVATE_KEY;
-    if (!privateKey) {
-        throw new Error("Please set your PRIVATE_KEY in a .env file");
-    }
 
-    // Create a wallet instance from the private key
-    const wallet = new ethers.Wallet(privateKey, ethers.provider);
+    // Get the first signer from the Hardhat runtime environment
+    const [deployer] = await ethers.getSigners();
 
-    console.log("Deploying contracts with the account:", wallet.address);
+    console.log("Deploying contracts with the account:", deployer.address);
 
-    const WBTC = await ethers.getContractFactory("WBTC");
+    const WBTB = await ethers.getContractFactory("WBTB");
     
     // Set the gas price (in wei)
-    const gasPrice = ethers.utils.parseUnits('20', 'gwei'); // Adjust this value as needed
+    const currentGasPrice = await ethers.provider.getGasPrice();
+    const maxGasPrice = ethers.utils.parseUnits("30", "gwei"); // Set max gas price to 100 Gwei
+    const gasPrice = currentGasPrice.gt(maxGasPrice) ? maxGasPrice : currentGasPrice;
     
-    const wbtc = await WBTC.deploy(wallet.address, { gasPrice: gasPrice });
-    await wbtc.deployed();
+    console.log(`Current gas price: ${ethers.utils.formatUnits(currentGasPrice, "gwei")} Gwei`);
+    console.log(`Using gas price: ${ethers.utils.formatUnits(gasPrice, "gwei")} Gwei`);
 
-    console.log("WBTC deployed to:", wbtc.address);
+    const wbtb = await WBTB.deploy(deployer.address, { gasPrice: gasPrice, gasLimit: 2600000 });
+    await wbtb.deployed();
+
+    console.log("WBTB deployed to:", wbtb.address);
+
+    // Verify the contract on Etherscan
+    if (process.env.ETHERSCAN_API_KEY) {
+        console.log("Verifying contract on Etherscan...");
+        await run("verify:verify", {
+            address: wbtb.address,
+            constructorArguments: [deployer.address],
+        });
+        console.log("Contract verified on Etherscan");
+    }
 }
 
 main()

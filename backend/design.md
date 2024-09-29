@@ -4,9 +4,9 @@
 
 A wallet ID is a unique identifier for a Bitcoin wallet, it is a base58 encoded string of `Bridge-Delegator-ETH-Addr`, which is implemented in frontend.
 
-## Wrap Logic (BTC to WBTC)
+## Wrap Logic (BTC to WBTB)
 
-The wrapping process converts BTC to WBTC through the following steps:
+The wrapping process converts BTC to WBTB through the following steps:
 
 1. Initiation:
    - Endpoint: `/initiate-wrap/`
@@ -28,9 +28,9 @@ The wrapping process converts BTC to WBTC through the following steps:
 4. Background Processing:
    - For `BROADCASTED` status:
      - Check Bitcoin transaction confirmation
-     - If confirmed: Mint WBTC, update status to `MINTING`, store minting tx hash
+     - If confirmed: Mint WBTB, update status to `MINTING`, store minting tx hash
    - For `MINTING` status:
-     - Check WBTC minting transaction confirmation
+     - Check WBTB minting transaction confirmation
      - If confirmed: Update status to `COMPLETED`
 
 5. Status Checking:
@@ -41,20 +41,20 @@ The wrapping process converts BTC to WBTC through the following steps:
    - Endpoint: `/wrap-history/{wallet_id}`
    - Allows frontend to query wrap history
 
-Rationale: This process ensures secure, traceable conversion from BTC to WBTC with proper status tracking and error handling.
+Rationale: This process ensures secure, traceable conversion from BTC to WBTB with proper status tracking and error handling.
 
-## Unwrap Logic (WBTC to BTC)
+## Unwrap Logic (WBTB to BTC)
 
-The unwrapping process converts WBTC back to BTC:
+The unwrapping process converts WBTB back to BTC:
 
 1. User Action:
    - Frontend displays an ETH address (`Bridge-Delegator-ETH-Addr`)
-   - User transfers WBTC to `Bridge-Delegator-ETH-Addr`
+   - User transfers WBTB to `Bridge-Delegator-ETH-Addr`
    - User confirms transfer in the app
 
 2. Initiation:
    - Endpoint: `/initiate-unwrap`
-   - Payload: signed ETH transaction to burn WBTC, with `wrp:wallet_id-btc_receiving_address` in calldata
+   - Payload: signed ETH transaction to burn WBTB, with `wrp:wallet_id-btc_receiving_address` in calldata
    - Processing:
      a. extract `Bridge-Delegator-ETH-Addr`, `amount`, `wallet_id` and `btc_receiving_address` from the signed ETH transaction.
      b. broadcast the signed ETH transaction, and insert a record in DB with status `INITIATED`, the record should contain `Bridge-Delegator-ETH-Addr`, `amount`, `wallet_id`, `eth_tx_hash` and `btc_receiving_address`.
@@ -82,17 +82,17 @@ The unwrapping process converts WBTC back to BTC:
    - Endpoint: `/unwrap-history/{wallet_id}`
    - Allows frontend to query unwrap history
 
-Rationale: This process ensures secure conversion from WBTC to BTC, handles potential transaction delays, and provides clear status tracking throughout the unwrapping process.
+Rationale: This process ensures secure conversion from WBTB to BTC, handles potential transaction delays, and provides clear status tracking throughout the unwrapping process.
 
 ## Fee
 
 ### Wrap Fee
 
-1. total: BTC transaction fee (0.0001 BTC) + ETH transaction fee (100 WBTC)
+1. total: BTC transaction fee (0.0001 BTC) + ETH transaction fee (100 WBTB)
 
 BTC transaction fee is included in the BTC transaction constructed in frontend.
 
-ETH transaction fee is charged when MINTING. Because the fee is paid in ETH by contract owner and the amount is unknown, the fee is fixed at 100 WBTC and deducted from the amount of WBTC minted. 
+ETH transaction fee is charged when MINTING. Because the fee is paid in ETH by contract owner and the amount is unknown, the fee is fixed at 100 WBTB and deducted from the amount of WBTB minted. 
 
 2. get Fee
    - Endpoint: `/wrap-fee`
@@ -139,4 +139,4 @@ python client.py unwrap-history --wallet-id your_wallet_id
 ## TODO:
 
 - [ ] design the status transition diagram
-- [ ] how to get the balance of WBTC in contract on chain
+- [ ] how to get the balance of WBTB in contract on chain
