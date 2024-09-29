@@ -178,8 +178,9 @@ class UnwrapTransaction(Base):
     amount = Column(Float, nullable=True)
     status = Column(String, default=TransactionStatus.UNWRAP_ETH_TRANSACTION_INITIATED)
     btb_tx_id = Column(String, nullable=True)
-    eth_sender = Column(String, nullable=True)  # New column
-    # New columns
+    eth_sender = Column(String, nullable=True)
+    sent_btb_amount = Column(Float, nullable=True)  # New column
+    # Existing columns
     exception_details = Column(Text, default='{}')
     exception_count = Column(Integer, default=0)
     last_exception_time = Column(DateTime, nullable=True)
@@ -362,7 +363,7 @@ async def wrap_history(wallet_id: str):
     wrap_txs: List[WrapTransaction] = session.query(WrapTransaction).filter(WrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"btb_tx_id": tx.btb_tx_id, "status": tx.status, "amount": tx.amount, "eth_tx_hash": tx.eth_tx_hash, "receiving_address": tx.receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in wrap_txs]
+    return [{"btb_tx_id": tx.btb_tx_id, "status": tx.status, "amount": tx.amount, "eth_tx_hash": tx.eth_tx_hash, "receiving_address": tx.receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "minted_wbtb_amount": tx.minted_wbtb_amount, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time} for tx in wrap_txs]
 
 @app.get("/unwrap-history/{wallet_id}")
 async def unwrap_history(wallet_id: str):
@@ -370,7 +371,19 @@ async def unwrap_history(wallet_id: str):
     unwrap_txs: List[UnwrapTransaction] = session.query(UnwrapTransaction).filter(UnwrapTransaction.wallet_id == wallet_id).all()
     session.close()
 
-    return [{"eth_tx_hash": tx.eth_tx_hash, "status": tx.status, "amount": tx.amount, "btb_tx_id": tx.btb_tx_id, "btb_receiving_address": tx.btb_receiving_address, "exception_details": tx.exception_details, "exception_count": tx.exception_count, "last_exception_time": tx.last_exception_time, "create_time": tx.create_time, "eth_sender": tx.eth_sender} for tx in unwrap_txs]
+    return [{
+        "eth_tx_hash": tx.eth_tx_hash,
+        "status": tx.status,
+        "amount": tx.amount,
+        "btb_tx_id": tx.btb_tx_id,
+        "btb_receiving_address": tx.btb_receiving_address,
+        "sent_btb_amount": tx.sent_btb_amount,  # Add this line
+        "exception_details": tx.exception_details,
+        "exception_count": tx.exception_count,
+        "last_exception_time": tx.last_exception_time,
+        "create_time": tx.create_time,
+        "eth_sender": tx.eth_sender
+    } for tx in unwrap_txs]
 
 # Add these new endpoints
 @app.get("/wrap-fee")
@@ -499,6 +512,9 @@ async def process_wrap_transactions():
                 # Deduct the ETH fee in WBTB
                 satoshis -= ETH_FEE_IN_WBTB * TokenUnit
                 
+                # Record the actual minted WBTB amount
+                tx.minted_wbtb_amount = satoshis / TokenUnit
+
                 # Mint WBTB
                 gas_price = int(w3.eth.gas_price * 1.1)
                 if gas_price > MaxGasPrice:
@@ -684,6 +700,11 @@ async def process_unwrap_transactions():
                 tx_outputs[bridge_address] = float(change)
 
             logger.info(f"tx_outputs: {tx_outputs}")
+
+            # Record the actual sent BTB amount
+            tx.sent_btb_amount = float(amount_to_send)
+            logger.info(f"Sent BTB amount: {tx.sent_btb_amount}")
+
             # Format OP_RETURN data as hexadecimal
             op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTB_RECEIVE_ADDRESS')}"
             op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
