@@ -621,8 +621,41 @@ async def process_unwrap_transactions():
                         logger.error(f"Unexpected function call: {func_signature}")
                         continue
                 elif eth_tx_receipt['status'] == 0:
-                    tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
-                    logger.error(f"unwrap Transaction {tx.eth_tx_hash} failed with status 0")
+                    logger.error(f"Unwrap transaction {tx.eth_tx_hash} failed with status 0")
+                    logger.info(f"Failed transaction receipt: {eth_tx_receipt}")
+                    
+                    transaction = w3.eth.get_transaction(tx.eth_tx_hash)
+                    logger.info(f"Failed transaction details: {transaction}")
+                    
+                    try:
+                        result = w3.eth.call(
+                            {
+                                'to': transaction['to'],
+                                'from': transaction['from'],
+                                'data': transaction['input'],
+                                'value': transaction['value'],
+                                'gas': transaction['gas'],
+                                'gasPrice': transaction['gasPrice'],
+                            },
+                            block_identifier=eth_tx_receipt['blockNumber'] - 1
+                        )
+                    except Exception as call_exception:
+                        revert_reason = str(call_exception)
+                        logger.error(f"Revert reason: {revert_reason}")
+                        
+                        # Check if it's an InsufficientBalance error
+                        if "0xe450d38c" in revert_reason:
+                            tx.status = TransactionStatus.FAILED_INSUFFICIENT_FUNDS
+                            error_message = "Insufficient balance for unwrap"
+                        else:
+                            tx.status = TransactionStatus.FAILED_TRANSACTION_UNKNOWN
+                            error_message = "Unknown error occurred"
+                        
+                        tx.exception_details = json.dumps({
+                            "error": error_message,
+                            # "receipt": str(eth_tx_receipt),
+                            "revert_reason": revert_reason
+                        })
                     continue
 
                 # If successful, reset exception details
