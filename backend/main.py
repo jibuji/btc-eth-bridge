@@ -29,6 +29,8 @@ from eth_utils import to_bytes, encode_hex
 from web3.auto import w3
 from datetime import datetime, timedelta
 import time
+from fastapi.middleware.cors import CORSMiddleware
+
 
 
 MIN_AMOUNT = 1000
@@ -39,12 +41,20 @@ ETH_FEE_IN_WBTB = 100
 TokenUnit = 100000000
 MaxGasPrice = 400*10**9 # 200 Gwei
 MAX_ATTEMPTS = 20
+UNWRAP_GAS_LIMIT = 50000
 
 # Add this constant near the top of the file
 CONFIRMATIONS_REQUIRED = 1
 
 # Add this constant near the top of the file, with the other constants
 DUST_THRESHOLD = Decimal('0.00000546')
+
+# Add this section to configure CORS
+origins = [
+    "http://localhost",  # Allow requests from localhost
+    # Add other origins as needed
+    "http://localhost:5173",
+]
 
 load_dotenv()
 
@@ -93,6 +103,14 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Allow requests from these origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Ethereum setup
 w3 = Web3(Web3.HTTPProvider(os.getenv("ETH_NODE_URL")))
@@ -397,7 +415,7 @@ async def get_wrap_fee():
 async def get_unwrap_fee():
     return {
         "btb_fee": float(BTB_FEE),
-        "eth_gas_price": w3.eth.gas_price
+        "eth_fee": round(w3.eth.gas_price / (10**9) * UNWRAP_GAS_LIMIT / (10**9), 6)
     }
 
 @app.get("/unwrap-eth-transaction-count/{address}")

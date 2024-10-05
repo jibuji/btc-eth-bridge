@@ -4,9 +4,9 @@
 
 A wallet ID is a unique identifier for a Bitcoin wallet, it is a base58 encoded string of `Bridge-Delegator-ETH-Addr`, which is implemented in frontend.
 
-## Wrap Logic (BTC to WBTB)
+## Wrap Logic (BTB to WBTB)
 
-The wrapping process converts BTC to WBTB through the following steps:
+The wrapping process converts BTB to WBTB through the following steps:
 
 1. Initiation:
    - Endpoint: `/initiate-wrap/`
@@ -34,18 +34,18 @@ The wrapping process converts BTC to WBTB through the following steps:
      - If confirmed: Update status to `COMPLETED`
 
 5. Status Checking:
-   - Endpoint: `/wrap-status/{btc_tx_id}`
+   - Endpoint: `/wrap-status/{btb_tx_id}`
    - Allows frontend to monitor wrapping progress
 
 6. Wrap history:
    - Endpoint: `/wrap-history/{wallet_id}`
    - Allows frontend to query wrap history
 
-Rationale: This process ensures secure, traceable conversion from BTC to WBTB with proper status tracking and error handling.
+Rationale: This process ensures secure, traceable conversion from BTB to WBTB with proper status tracking and error handling.
 
-## Unwrap Logic (WBTB to BTC)
+## Unwrap Logic (WBTB to BTB)
 
-The unwrapping process converts WBTB back to BTC:
+The unwrapping process converts WBTB back to BTB:
 
 1. User Action:
    - Frontend displays an ETH address (`Bridge-Delegator-ETH-Addr`)
@@ -54,10 +54,10 @@ The unwrapping process converts WBTB back to BTC:
 
 2. Initiation:
    - Endpoint: `/initiate-unwrap`
-   - Payload: signed ETH transaction to burn WBTB, with `wrp:wallet_id-btc_receiving_address` in calldata
+   - Payload: signed ETH transaction to burn WBTB, with `wrp:wallet_id-btb_receiving_address` in calldata
    - Processing:
-     a. extract `Bridge-Delegator-ETH-Addr`, `amount`, `wallet_id` and `btc_receiving_address` from the signed ETH transaction.
-     b. broadcast the signed ETH transaction, and insert a record in DB with status `INITIATED`, the record should contain `Bridge-Delegator-ETH-Addr`, `amount`, `wallet_id`, `eth_tx_hash` and `btc_receiving_address`.
+     a. extract `Bridge-Delegator-ETH-Addr`, `amount`, `wallet_id` and `btb_receiving_address` from the signed ETH transaction.
+     b. broadcast the signed ETH transaction, and insert a record in DB with status `INITIATED`, the record should contain `Bridge-Delegator-ETH-Addr`, `amount`, `wallet_id`, `eth_tx_hash` and `btb_receiving_address`.
      c. return a eth_tx_hash to frontend
 
 3. Background Processing:
@@ -65,13 +65,13 @@ The unwrapping process converts WBTB back to BTC:
      a. if `eth_tx_hash` is not confirmed, skip and check again later.
      b. extract the tx details and update the record with new details.
      c. if amount meets the minimum unwrap amount:
-        - Generate signed BTC transaction to `receiving_btc_address`
+        - Generate signed BTB transaction to `receiving_btb_address`
         - Include `Bridge-Delegator-ETH-Addr` and wallet ID in OP_RETURN output
         - Broadcast transaction
-        - Insert field `btc_unwrapping_tx_hash` to record 
+        - Insert field `btb_unwrapping_tx_hash` to record 
         - Set status to `BROADCASTED`
    - For `BROADCASTED` status:
-     - Check BTC transaction confirmation
+     - Check BTB transaction confirmation
      - If confirmed, update status to `COMPLETED`
 
 4. Status Checking:
@@ -82,15 +82,15 @@ The unwrapping process converts WBTB back to BTC:
    - Endpoint: `/unwrap-history/{wallet_id}`
    - Allows frontend to query unwrap history
 
-Rationale: This process ensures secure conversion from WBTB to BTC, handles potential transaction delays, and provides clear status tracking throughout the unwrapping process.
+Rationale: This process ensures secure conversion from WBTB to BTB, handles potential transaction delays, and provides clear status tracking throughout the unwrapping process.
 
 ## Fee
 
 ### Wrap Fee
 
-1. total: BTC transaction fee (0.0001 BTC) + ETH transaction fee (100 WBTB)
+1. total: BTB transaction fee (0.0001 BTB) + ETH transaction fee (100 WBTB)
 
-BTC transaction fee is included in the BTC transaction constructed in frontend.
+BTB transaction fee is included in the BTB transaction constructed in frontend.
 
 ETH transaction fee is charged when MINTING. Because the fee is paid in ETH by contract owner and the amount is unknown, the fee is fixed at 100 WBTB and deducted from the amount of WBTB minted. 
 
@@ -101,18 +101,18 @@ ETH transaction fee is charged when MINTING. Because the fee is paid in ETH by c
 
       ```json
       {
-        "btc_fee": 0.0001,
-        "eth_fee_in_wbtc": 100
+        "btb_fee": 0.0001,
+        "eth_fee_in_wbtb": 100
       }
       ```
 
 ### Unwrap Fee
 
-total: ETH transaction fee (unknown) + BTC transaction fee (0.0001 BTC)
+total: ETH transaction fee (unknown) + BTB transaction fee (0.0001 BTB)
 
 ETH transaction fee is included in the ETH transaction constructed in frontend.
 
-BTC transaction fee is included in the BTC transaction constructed in backend.
+BTB transaction fee is included in the BTB transaction constructed in backend.
 
 2. get Fee
    - Endpoint: `/unwrap-fee`
@@ -121,7 +121,7 @@ BTC transaction fee is included in the BTC transaction constructed in backend.
    
       ```json
       {
-        "btc_fee": 0.0001,
+        "btb_fee": 0.0001,
         "eth_fee": 0
       }
       ```
@@ -130,7 +130,7 @@ BTC transaction fee is included in the BTC transaction constructed in backend.
 ```bash
 python client.py wrap --amount 1001.1 --wallet-id your_wallet_id
 python client.py unwrap --amount 1001.1 --wallet-id your_wallet_id
-python client.py wrap-status --tx-id your_btc_tx_id
+python client.py wrap-status --tx-id your_btb_tx_id
 python client.py unwrap-status --tx-id your_eth_tx_hash
 python client.py wrap-history --wallet-id your_wallet_id
 python client.py unwrap-history --wallet-id your_wallet_id
