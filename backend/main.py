@@ -30,6 +30,8 @@ from web3.auto import w3
 from datetime import datetime, timedelta
 import time
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from web3.exceptions import InvalidAddress
 
 
 
@@ -228,6 +230,8 @@ async def initiate_wrap(wrap_request: WrapRequest):
         op_return_data = binascii.unhexlify(op_return_data).decode()
         logger.info(f"op return data: {op_return_data}")
         wallet_id, receiving_address = op_return_data.split(':')[1].split('-')
+        if not receiving_address.startswith('0x'):
+            receiving_address = '0x' + receiving_address
         logger.info(f"wallet id: {wallet_id}")
         logger.info(f"receiving address: {receiving_address}")
         amount = sum(output['value'] for output in decoded_tx['vout'] 
@@ -403,21 +407,43 @@ async def unwrap_history(wallet_id: str):
         "eth_sender": tx.eth_sender
     } for tx in unwrap_txs]
 
+@app.get("/bridge-info")
+async def get_bridge_info():
+    try:
+        # Get WBTB contract ABI
+        wbtb_abi = contract_abi
+
+        # Get wrap fee
+        wrap_fee = {
+            "btb_fee": float(BTB_FEE),
+            "eth_fee_in_wbtb": ETH_FEE_IN_WBTB
+        }
+
+        # Get unwrap fee
+        unwrap_fee = {
+            "btb_fee": float(BTB_FEE),
+            "eth_fee": round(w3.eth.gas_price / (10**9) * UNWRAP_GAS_LIMIT / (10**9), 6)
+        }
+
+        # Minimum amount of WBTB to wrap
+        min_wrap_amount = 10_000
+
+        # Combine all information
+        bridge_info = {
+            "wbtb_contract_abi": wbtb_abi,
+            "wrap_fee": wrap_fee,
+            "unwrap_fee": unwrap_fee,
+            "min_wrap_amount": min_wrap_amount,
+            "bridge_btb_address": bridge_btb_address,
+            "wbtb_contract_address": wbtb_address
+        }
+
+        return JSONResponse(content=bridge_info)
+    except Exception as e:
+        logger.error(f"Error getting bridge info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Add these new endpoints
-@app.get("/wrap-fee")
-async def get_wrap_fee():
-    return {
-        "btb_fee": float(BTB_FEE),
-        "eth_fee_in_wbtb": ETH_FEE_IN_WBTB
-    }
-
-@app.get("/unwrap-fee")
-async def get_unwrap_fee():
-    return {
-        "btb_fee": float(BTB_FEE),
-        "eth_fee": round(w3.eth.gas_price / (10**9) * UNWRAP_GAS_LIMIT / (10**9), 6)
-    }
-
 @app.get("/unwrap-eth-transaction-count/{address}")
 async def get_unwrap_eth_transaction_count(address: str):
     try:
@@ -453,6 +479,36 @@ async def get_bridge_addresses():
         "btb_bridge_address": bridge_btb_address,
         "eth_bridge_contract_address": wbtb_address
     }
+
+# Add this new endpoint
+@app.get("/eth-address/{address}/balance")
+async def get_eth_address_balance(address: str):
+    try:
+        # Validate the Ethereum address
+        if not w3.is_address(address):
+            raise HTTPException(status_code=400, detail="Invalid Ethereum address")
+
+        # Convert to checksum address
+        checksum_address = w3.to_checksum_address(address)
+
+        # Get ETH balance
+        eth_balance = w3.eth.get_balance(checksum_address)
+        eth_balance_in_ether = w3.from_wei(eth_balance, 'ether')
+
+        # Get WBTB balance
+        wbtb_balance = compiled_sol.functions.balanceOf(checksum_address).call()
+        wbtb_balance_in_btb = wbtb_balance / 1e8  # Convert from satoshis to BTB
+
+        return {
+            "address": checksum_address,
+            "eth_balance": float(eth_balance_in_ether),
+            "wbtb_balance": float(wbtb_balance_in_btb)
+        }
+    except InvalidAddress:
+        raise HTTPException(status_code=400, detail="Invalid Ethereum address")
+    except Exception as e:
+        logger.error(f"Error getting balance for address {address}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Background tasks (to be run periodically)
 
@@ -542,6 +598,8 @@ async def process_wrap_transactions():
 
                 nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                 chain_id = w3.eth.chain_id  # Get the current chain ID
+                if not tx.receiving_address.startswith('0x'):
+                    tx.receiving_address = '0x' + tx.receiving_address
                 mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
                     'chainId': chain_id,
                     'gasPrice': int(gas_price),

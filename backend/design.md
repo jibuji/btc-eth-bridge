@@ -1,5 +1,3 @@
-
-
 ## Wallet ID Generation
 
 A wallet ID is a unique identifier for a Bitcoin wallet, it is a base58 encoded string of `Bridge-Delegator-ETH-Addr`, which is implemented in frontend.
@@ -84,57 +82,44 @@ The unwrapping process converts WBTB back to BTB:
 
 Rationale: This process ensures secure conversion from WBTB to BTB, handles potential transaction delays, and provides clear status tracking throughout the unwrapping process.
 
-## Fee
+## Fee and Bridge Information
 
-### Wrap Fee
+To provide a consolidated view of the bridge information, including fees and contract details, we use a single endpoint:
 
-1. total: BTB transaction fee (0.0001 BTB) + ETH transaction fee (100 WBTB)
+### Bridge Info
 
-BTB transaction fee is included in the BTB transaction constructed in frontend.
+- Endpoint: `/bridge-info`
+- Method: GET
+- Input: None
+- Output: JSON containing WBTB contract ABI, wrap fee, and unwrap fee
 
-ETH transaction fee is charged when MINTING. Because the fee is paid in ETH by contract owner and the amount is unknown, the fee is fixed at 100 WBTB and deducted from the amount of WBTB minted. 
-
-2. get Fee
-   - Endpoint: `/wrap-fee`
-   - Input: None
-   - Output: 
-
-      ```json
-      {
-        "btb_fee": 0.0001,
-        "eth_fee_in_wbtb": 100
-      }
-      ```
-
-### Unwrap Fee
-
-total: ETH transaction fee (unknown) + BTB transaction fee (0.0001 BTB)
-
-ETH transaction fee is included in the ETH transaction constructed in frontend.
-
-BTB transaction fee is included in the BTB transaction constructed in backend.
-
-2. get Fee
-   - Endpoint: `/unwrap-fee`
-   - Input: None
-   - Output: 
-   
-      ```json
-      {
-        "btb_fee": 0.0001,
-        "eth_fee": 0
-      }
-      ```
-
-
-```bash
-python client.py wrap --amount 1001.1 --wallet-id your_wallet_id
-python client.py unwrap --amount 1001.1 --wallet-id your_wallet_id
-python client.py wrap-status --tx-id your_btb_tx_id
-python client.py unwrap-status --tx-id your_eth_tx_hash
-python client.py wrap-history --wallet-id your_wallet_id
-python client.py unwrap-history --wallet-id your_wallet_id
+```json
+{
+  "wbtb_contract_abi": [...],
+  "wrap_fee": {
+    "btb_fee": 0.0001,
+    "eth_fee_in_wbtb": 100
+  },
+  "unwrap_fee": {
+    "btb_fee": 0.0001,
+    "eth_fee": 0.000123
+  }
+}
 ```
+
+#### Wrap Fee Details
+
+- Total wrap fee: BTB transaction fee (0.0001 BTB) + ETH transaction fee (100 WBTB)
+- BTB transaction fee is included in the BTB transaction constructed in frontend.
+- ETH transaction fee is charged when MINTING. Because the fee is paid in ETH by contract owner and the amount is unknown, the fee is fixed at 100 WBTB and deducted from the amount of WBTB minted.
+
+#### Unwrap Fee Details
+
+- Total unwrap fee: ETH transaction fee (variable) + BTB transaction fee (0.0001 BTB)
+- ETH transaction fee is included in the ETH transaction constructed in frontend.
+- BTB transaction fee is included in the BTB transaction constructed in backend.
+
+Rationale: This consolidated endpoint provides all necessary information about the bridge, including contract details and fees, in a single request. This reduces the number of API calls needed and simplifies the process for frontend integration.
 
 ## TODO:
 
