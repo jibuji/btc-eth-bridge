@@ -35,7 +35,7 @@ from web3.exceptions import InvalidAddress
 
 
 
-MIN_AMOUNT = 1000
+MIN_AMOUNT = 1
 
 # Add these constants near the top of the file
 BTB_FEE = Decimal('0.01')
@@ -422,7 +422,9 @@ async def get_bridge_info():
         # Get unwrap fee
         unwrap_fee = {
             "btb_fee": float(BTB_FEE),
-            "eth_fee": round(w3.eth.gas_price / (10**9) * UNWRAP_GAS_LIMIT / (10**9), 6)
+            "eth_fee": round(w3.eth.gas_price / (10**9) * UNWRAP_GAS_LIMIT / (10**9), 6),
+            "eth_gas_price": str(w3.eth.gas_price),
+            "eth_gas_limit": UNWRAP_GAS_LIMIT,
         }
 
         # Minimum amount of WBTB to wrap
@@ -435,7 +437,8 @@ async def get_bridge_info():
             "unwrap_fee": unwrap_fee,
             "min_wrap_amount": min_wrap_amount,
             "bridge_btb_address": bridge_btb_address,
-            "wbtb_contract_address": wbtb_address
+            "wbtb_contract_address": wbtb_address,
+            "eth_chain_id": w3.eth.chain_id
         }
 
         return JSONResponse(content=bridge_info)
@@ -466,7 +469,8 @@ async def get_unwrap_eth_transaction_count(address: str):
             "address": address,
             "eth_transaction_count": eth_nonce,
             "unwrap_transaction_count": unwrap_count,
-            "final_nonce": final_nonce
+            "final_nonce": final_nonce,
+            "chain_id": w3.eth.chain_id,
         }
     except Exception as e:
         logger.error(f"Error getting transaction count for address {address}: {e}")
@@ -594,13 +598,17 @@ async def process_wrap_transactions():
                 if gas_price > MaxGasPrice:
                     gas_price = MaxGasPrice
 
-                logger.info(f"mintinggas_price: {gas_price}")
+                logger.info(f"minting gas_price: {gas_price}")
 
                 nonce = w3.eth.get_transaction_count(os.getenv("OWNER_ADDRESS"))
                 chain_id = w3.eth.chain_id  # Get the current chain ID
+                
                 if not tx.receiving_address.startswith('0x'):
                     tx.receiving_address = '0x' + tx.receiving_address
-                mint_tx = compiled_sol.functions.mint(tx.receiving_address, satoshis).build_transaction({
+                # Convert the receiving address to checksum format
+                checksum_receiving_address = w3.to_checksum_address(tx.receiving_address)
+                
+                mint_tx = compiled_sol.functions.mint(checksum_receiving_address, satoshis).build_transaction({
                     'chainId': chain_id,
                     'gasPrice': int(gas_price),
                     'nonce': nonce,
@@ -781,13 +789,15 @@ async def process_unwrap_transactions():
             total_needed = amount_to_send + BTB_FEE
 
             # Fetch unspent UTXOs with minimum amount and sum
-            unspent = rpc_connection.listunspent(0, 9999999, [bridge_address], False, {
+            unspent = rpc_connection.listunspent(0, 999999999, [bridge_address], False, {
                 "minimumAmount": float(DUST_THRESHOLD),
                 "minimumSumAmount": float(total_needed)
             })
-            
+            if tx.eth_tx_hash == "0x4aeab91cf04675a2589db1b51710984283ef570403d591dfa4719da2a2a4b317":
+                logger.info(f"unspent: {unspent} total_needed: {total_needed} bridge_address: {bridge_address}")
+                
             if not unspent:
-                logger.error("No unspent transactions found")
+                logger.error(f"No unspent transactions found for total_needed: {total_needed} and bridge_address: {bridge_address}")
                 raise Exception("No unspent transactions found")
 
             # Calculate total available amount
@@ -813,12 +823,16 @@ async def process_unwrap_transactions():
             # Record the actual sent BTB amount
             tx.sent_btb_amount = float(amount_to_send)
             logger.info(f"Sent BTB amount: {tx.sent_btb_amount}")
-
+            wbtb_receive_address = tx.btb_receiving_address
+            if wbtb_receive_address.startswith('0x'):
+                wbtb_receive_address = wbtb_receive_address[2:]
             # Format OP_RETURN data as hexadecimal
-            op_return_data = f"wrp:{tx.wallet_id}-{os.getenv('WBTB_RECEIVE_ADDRESS')}"
+            op_return_data = f"un:{tx.wallet_id}-{wbtb_receive_address}"
+            logger.info(f"op_return_data: {op_return_data}")
+
             op_return_hex = binascii.hexlify(op_return_data.encode()).decode()
             tx_outputs["data"] = op_return_hex
-
+            logger.info(f"tx_outputs: {tx_outputs}")
             # Create raw transaction
             btb_tx = rpc_connection.createrawtransaction(tx_inputs, tx_outputs)
 

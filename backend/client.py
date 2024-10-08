@@ -95,7 +95,11 @@ def get_unwrap_eth_transaction_count(address):
     try:
         response = requests.get(f"{SERVER_URL}/unwrap-eth-transaction-count/{address}")
         if response.status_code == 200:
-            return response.json()['final_nonce']
+            data = response.json()
+            return {
+                'final_nonce': data['final_nonce'],
+                'chain_id': data['chain_id']
+            }
         else:
             print(f"Failed to get transaction count. Status code: {response.status_code}")
             print(f"Response content: {response.text}")
@@ -117,7 +121,9 @@ def create_and_send_eth_transaction(wbtb_amount, wallet_id, btb_receiving_addres
 
         # Get the current chain ID
         chain_id = w3.eth.chain_id
-
+        print("chain_id:", chain_id)
+        print("gas_price:", w3.eth.gas_price, type(w3.eth.gas_price))
+        
         satoshis = int(wbtb_amount * 100000000)  # 1 BTB = 100,000,000 satoshis
 
         print("satoshis:", satoshis)
